@@ -31,7 +31,39 @@ jobs:
           ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/azimuth-0.9.10/"
           ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/azimuth-1.0.1/"
           ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/extra_options/"
-          codesign --verify --deep --strict "dist/Forza Horizon 2.app"
+          file "dist/Forza Horizon 2.app/Contents/MacOS/FH2Launcher"
+          file "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/d3d12.dll"
+          file "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/fh2pad.dll"
+          file "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/d3dcompiler_47.dll"
+          codesign --verify --deep --strict --verbose=2 "dist/Forza Horizon 2.app"
+
+      - name: Run Live Runtime Self-Test, GUI Launch Test & Mounted DMG Test
+        run: |
+          echo "=== 1. Running End-to-End Runtime Self-Test on Built App ==="
+          "dist/Forza Horizon 2.app/Contents/MacOS/FH2Launcher" --self-test
+
+          echo "=== 2. Running Live macOS GUI Window Launch Test (5s stability check) ==="
+          rm -f "$HOME/Library/Logs/FH2Port/launcher.log"
+          "dist/Forza Horizon 2.app/Contents/MacOS/FH2Launcher" &
+          GUI_PID=$!
+          sleep 5
+          if ! kill -0 "$GUI_PID" 2>/dev/null; then
+            echo "ERROR: FH2Launcher GUI process ($GUI_PID) exited or crashed!"
+            exit 1
+          fi
+          echo "[PASS] FH2Launcher GUI process (PID $GUI_PID) is alive and stable after 5 seconds."
+          kill -TERM "$GUI_PID" 2>/dev/null || true
+          wait "$GUI_PID" 2>/dev/null || true
+          cat "$HOME/Library/Logs/FH2Port/launcher.log"
+
+          echo "=== 3. Mounting DMG and Running Self-Test Directly From Mounted Volume ==="
+          MOUNT_DIR="/Volumes/Forza Horizon 2"
+          hdiutil attach "dist/Forza-Horizon-2-Mac-Installer.dmg" -mountpoint "$MOUNT_DIR" -nobrowse -readonly
+          ls -la "$MOUNT_DIR"
+          test -L "$MOUNT_DIR/Applications"
+          codesign --verify --deep --strict "$MOUNT_DIR/Forza Horizon 2.app"
+          "$MOUNT_DIR/Forza Horizon 2.app/Contents/MacOS/FH2Launcher" --self-test
+          hdiutil detach "$MOUNT_DIR"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

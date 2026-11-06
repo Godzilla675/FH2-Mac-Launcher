@@ -676,243 +676,13 @@ final class LauncherViewModel: ObservableObject {
         launchStatusText = "Preparing Wine prefix & FH2 compatibility layer..."
         appendLog("=== Starting Forza Horizon 2 launch sequence ===")
 
-        let selectedAzimuth = azimuthBuild
-        let selectedResolution = resolution
-        let useExtraOptions = enableExtraOptions
-        let useMetalHUD = showMetalHUD
-        let userGameFolder = URL(fileURLWithPath: gameFolderPath).resolvingSymlinksInPath().path
-        let currentEnv = envStatus
-
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             do {
-                let fm = FileManager.default
-                let home = fm.homeDirectoryForCurrentUser
-                guard let payloadRoot = Bundle.main.resourceURL?.appendingPathComponent("payload") else {
-                    throw NSError(domain: "FH2Launch", code: 1, userInfo: [
-                        NSLocalizedDescriptionKey: "Bundled payload directory is missing from app bundle."
-                    ])
-                }
-
-                // 1. Determine bottle / prefix path
-                let bottleURL: URL
-                let isCrossOver = (currentEnv.runtimeKind == .crossover || currentEnv.runtimeKind == .crossoverPreview)
-                if isCrossOver {
-                    let cxBottlesDir = home.appendingPathComponent("Library/Application Support/CrossOver/Bottles")
-                    bottleURL = cxBottlesDir.appendingPathComponent("ForzaHorizon2")
-                } else {
-                    let fh2SupportDir = home.appendingPathComponent("Library/Application Support/FH2Port")
-                    bottleURL = fh2SupportDir.appendingPathComponent("bottle")
-                }
-
-                let driveCURL = bottleURL.appendingPathComponent("drive_c")
-                let azimuthDirName = "Azimuth"
-                let azimuthDestURL = driveCURL.appendingPathComponent(azimuthDirName)
-
-                // Build runtime environment variables for Wine + D3DMetal
-                var wineEnv = ProcessInfo.processInfo.environment
-                wineEnv["WINEPREFIX"] = bottleURL.path
-                wineEnv["WINEDEBUG"] = "-all"
-                wineEnv["WINEMSYNC"] = "1"
-                wineEnv["WINEESYNC"] = "0"
-                wineEnv["D3DMETAL"] = "1"
-                wineEnv["MTL_HUD_ENABLED"] = useMetalHUD ? "1" : "0"
-
-                // Per requirement: launch with D3DMETAL=1 and ROSETTA_ADVERTISE_AVX=0
-                // Note: Rosetta advertises AVX if ROSETTA_ADVERTISE_AVX is set to any value in some macOS versions unless unset or 0;
-                // we set ROSETTA_ADVERTISE_AVX=0 as requested by spec.
-                wineEnv["ROSETTA_ADVERTISE_AVX"] = "0"
-
-                if isCrossOver {
-                    wineEnv["CX_BOTTLE"] = bottleURL.path
-                    wineEnv["CX_GRAPHICS_BACKEND"] = "d3dmetal"
-                } else if let extDir = currentEnv.d3dMetalExternalDir {
-                    wineEnv["CX_D3DMETALPATH"] = extDir.path
-                    let existingLib = wineEnv["DYLD_FALLBACK_LIBRARY_PATH"] ?? "/usr/local/lib:/usr/lib"
-                    let existingFw = wineEnv["DYLD_FALLBACK_FRAMEWORK_PATH"] ?? "/Library/Frameworks:/System/Library/Frameworks"
-                    var libPaths = [extDir.path]
-                    var fwPaths = [extDir.path]
-
-                    if let gptkApp = currentEnv.gptkAppURL {
-                        let wineLib = gptkApp.appendingPathComponent("Contents/Resources/wine/lib").path
-                        libPaths.append(wineLib)
-                    }
-                    if let hbRoot = currentEnv.highballRoot {
-                        let hbFw = hbRoot.appendingPathComponent("frameworks").path
-                        let gstLib = hbRoot.appendingPathComponent("frameworks/GStreamer.framework/Versions/1.0/lib").path
-                        libPaths.append(hbFw)
-                        libPaths.append(gstLib)
-                        fwPaths.append(hbFw)
-                    }
-                    if let gptkWineDll = currentEnv.gptkWineDllDir {
-                        wineEnv["WINEDLLPATH_PREPEND"] = gptkWineDll.path
-                    }
-                    wineEnv["DYLD_FALLBACK_LIBRARY_PATH"] = (libPaths + [existingLib]).joined(separator: ":")
-                    wineEnv["DYLD_FALLBACK_FRAMEWORK_PATH"] = (fwPaths + [existingFw]).joined(separator: ":")
-                }
-
-                guard let wineBin = currentEnv.wineExecutable else {
-                    throw NSError(domain: "FH2Launch", code: 2, userInfo: [
-                        NSLocalizedDescriptionKey: "Wine executable not found."
-                    ])
-                }
-
-                // 2. Initialize bottle if `system.reg` does not exist yet
-                if !fm.fileExists(atPath: bottleURL.appendingPathComponent("system.reg").path) {
-                    self.updateLaunchStatus("Initializing Windows 10 64-bit bottle (first run only)...")
-                    try fm.createDirectory(at: bottleURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-                    if isCrossOver, let cxbottle = currentEnv.cxBottleExecutable {
-                        self.appendLog("Creating CrossOver win10_64 bottle at \(bottleURL.path)")
-                        _ = self.runProcess(
-                            executable: cxbottle.path,
-                            args: ["--bottle", bottleURL.path, "--create", "--template", "win10_64"],
-                            env: wineEnv
-                        )
-                    } else {
-                        try fm.createDirectory(at: bottleURL, withIntermediateDirectories: true)
-                        self.appendLog("Bootstrapping Wine prefix at \(bottleURL.path) via wineboot -u")
-                        _ = self.runProcess(
-                            executable: wineBin.path,
-                            args: ["wineboot", "-u"],
-                            env: wineEnv
-                        )
-                        if let srv = currentEnv.wineserverExecutable {
-                            _ = self.runProcess(executable: srv.path, args: ["-w"], env: wineEnv)
-                        }
-                    }
-                }
-
-                try fm.createDirectory(at: azimuthDestURL.appendingPathComponent("data/logs"), withIntermediateDirectories: true)
-
-                // 3. Copy selected Azimuth build (`0.9.10` or `1.0.1`) preserving `data/titles` (saves)
-                self.updateLaunchStatus("Installing Azimuth \(selectedAzimuth.rawValue) + Apple Silicon D3D12 & Gamepad shims...")
-                let bundledAzDir = payloadRoot.appendingPathComponent(selectedAzimuth.payloadSubfolder)
-                guard fm.fileExists(atPath: bundledAzDir.appendingPathComponent("azimuth.exe").path) else {
-                    throw NSError(domain: "FH2Launch", code: 3, userInfo: [
-                        NSLocalizedDescriptionKey: "Bundled Azimuth \(selectedAzimuth.rawValue) payload not found at \(bundledAzDir.path)."
-                    ])
-                }
-
-                // Use `/usr/bin/ditto` to merge bundled Azimuth into `drive_c/Azimuth` so user saves in `data/titles` are never deleted
-                let (dittoCode, dittoOut) = self.runProcess(
-                    executable: "/usr/bin/ditto",
-                    args: [bundledAzDir.path, azimuthDestURL.path]
-                )
-                if dittoCode != 0 {
-                    throw NSError(domain: "FH2Launch", code: Int(dittoCode), userInfo: [
-                        NSLocalizedDescriptionKey: "Failed to copy Azimuth payload: \(dittoOut)"
-                    ])
-                }
-
-                // 4. Copy `d3d12.dll`, `fh2pad.dll`, and `d3dcompiler_47.dll` next to `azimuth.exe`
-                let layerDir = payloadRoot.appendingPathComponent("layer")
-                for dll in ["d3d12.dll", "fh2pad.dll", "d3dcompiler_47.dll"] {
-                    let src = layerDir.appendingPathComponent(dll)
-                    let dst = azimuthDestURL.appendingPathComponent(dll)
-                    if fm.fileExists(atPath: src.path) {
-                        try? fm.removeItem(at: dst)
-                        try fm.copyItem(at: src, to: dst)
-                    } else {
-                        self.appendLog("Warning: \(dll) missing from \(layerDir.path)")
-                    }
-                }
-
-                // 5. Handle Optional `ForzaHorizon2_ExtraOptions` mod
-                let extraOptionsSrc = payloadRoot.appendingPathComponent("extra_options")
-                let winmmDst = azimuthDestURL.appendingPathComponent("winmm.dll")
-                let eoIniDst = azimuthDestURL.appendingPathComponent("FH2_ExtraOptions.ini")
-                let modsDst = azimuthDestURL.appendingPathComponent("mods")
-
-                if useExtraOptions && fm.fileExists(atPath: extraOptionsSrc.appendingPathComponent("winmm.dll").path) {
-                    self.appendLog("Enabling ForzaHorizon2_ExtraOptions (Unlock All DLC & Skip Intro Videos)")
-                    try? fm.removeItem(at: winmmDst)
-                    try fm.copyItem(at: extraOptionsSrc.appendingPathComponent("winmm.dll"), to: winmmDst)
-                    if !fm.fileExists(atPath: eoIniDst.path) {
-                        try? fm.copyItem(at: extraOptionsSrc.appendingPathComponent("FH2_ExtraOptions.ini"), to: eoIniDst)
-                    }
-                    if fm.fileExists(atPath: extraOptionsSrc.appendingPathComponent("mods").path) {
-                        _ = self.runProcess(
-                            executable: "/usr/bin/ditto",
-                            args: [extraOptionsSrc.appendingPathComponent("mods").path, modsDst.path]
-                        )
-                    }
-                } else {
-                    self.appendLog("ExtraOptions disabled — removing winmm.dll hook if present")
-                    try? fm.removeItem(at: winmmDst)
-                }
-
-                // 6. Apply Wine Registry & DLL Overrides (matching `FH2-Port-AppleSilicon/scripts/install.sh`)
-                self.updateLaunchStatus("Applying Wine registry & DLL overrides for Azimuth...")
-                let appKey = #"HKCU\Software\Wine\AppDefaults\azimuth.exe\DllOverrides"#
-                let padKey = #"HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.Input.Gamepad"#
-                let busKey = #"HKLM\System\CurrentControlSet\Services\WineBus"#
-
-                var regCommands: [[String]] = [
-                    ["reg", "add", appKey, "/v", "d3d12", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
-                    ["reg", "add", appKey, "/v", "d3dcompiler_47", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
-                    ["reg", "add", appKey, "/v", "msvcr110", "/t", "REG_SZ", "/d", "native", "/f"],
-                    ["reg", "add", appKey, "/v", "msvcp110", "/t", "REG_SZ", "/d", "native", "/f"],
-                    ["reg", "add", appKey, "/v", "vcruntime140", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
-                    ["reg", "add", appKey, "/v", "vcruntime140_1", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
-                    ["reg", "add", appKey, "/v", "msvcp140", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
-                    ["reg", "add", appKey, "/v", "concrt140", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
-                    ["reg", "add", padKey, "/v", "DllPath", "/t", "REG_SZ", "/d", #"C:\Azimuth\fh2pad.dll"#, "/f"],
-                    ["reg", "add", busKey, "/v", "DisableHidraw", "/t", "REG_DWORD", "/d", "1", "/f"]
-                ]
-
-                if useExtraOptions {
-                    regCommands.append(["reg", "add", appKey, "/v", "winmm", "/t", "REG_SZ", "/d", "native,builtin", "/f"])
-                } else {
-                    regCommands.append(["reg", "delete", appKey, "/v", "winmm", "/f"])
-                }
-
-                for cmd in regCommands {
-                    _ = self.runProcess(executable: wineBin.path, args: cmd, env: wineEnv)
-                }
-
-                // 7. Configure `data/azimuth.ini` (UTF-16LE with BOM) with resolution, antialiasing=off, and FH2 game folder path
-                self.updateLaunchStatus("Configuring data/azimuth.ini (\(selectedResolution.rawValue)p, antialiasing=off)...")
-                let iniURL = azimuthDestURL.appendingPathComponent("data/azimuth.ini")
-                let winGamePath = "Z:" + userGameFolder.replacingOccurrences(of: "/", with: "\\")
-                try Self.configureAzimuthIni(
-                    at: iniURL,
-                    resolution: selectedResolution.rawValue,
-                    windowsGamePath: winGamePath,
-                    azimuthBuild: selectedAzimuth
-                )
-                self.appendLog("Configured \(iniURL.path) -> folder=\(winGamePath), resolution=\(selectedResolution.rawValue), antialiasing=off")
-
-                // Rotate fh2port.log if present
-                let fh2Log = azimuthDestURL.appendingPathComponent("data/logs/fh2port.log")
-                let fh2PrevLog = azimuthDestURL.appendingPathComponent("data/logs/fh2port.prev.log")
-                if fm.fileExists(atPath: fh2Log.path) {
-                    try? fm.removeItem(at: fh2PrevLog)
-                    try? fm.moveItem(at: fh2Log, to: fh2PrevLog)
-                }
-
-                // 8. Launch `azimuth.exe` with `--skip-launcher` so it boots directly into Forza Horizon 2!
-                self.updateLaunchStatus("Launching Forza Horizon 2...")
-                let wineLogURL = azimuthDestURL.appendingPathComponent("data/logs/wine.log")
-                fm.createFile(atPath: wineLogURL.path, contents: nil)
-                let logHandle = try? FileHandle(forWritingTo: wineLogURL)
-
-                let proc = Process()
-                proc.executableURL = wineBin
-                proc.currentDirectoryURL = azimuthDestURL
-                proc.arguments = [#"C:\Azimuth\azimuth.exe"#, "--skip-launcher"]
-                proc.environment = wineEnv
-                if let logHandle = logHandle {
-                    proc.standardOutput = logHandle
-                    proc.standardError = logHandle
-                }
-
-                try proc.run()
-                self.appendLog("Started azimuth.exe (PID \(proc.processIdentifier)) in bottle \(bottleURL.path)")
-
+                let pid = try self.executeLaunchSequence()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                     self.isLaunchingGame = false
-                    self.launchStatusText = "Forza Horizon 2 is running (PID \(proc.processIdentifier))."
+                    self.launchStatusText = "Forza Horizon 2 is running (PID \(pid))."
                 }
             } catch {
                 self.appendLog("Launch failed: \(error.localizedDescription)")
@@ -923,6 +693,244 @@ final class LauncherViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    @discardableResult
+    func executeLaunchSequence(
+        bottleOverrideURL: URL? = nil,
+        envOverride: RuntimeEnvironment? = nil,
+        gameFolderOverride: String? = nil
+    ) throws -> Int32 {
+        let selectedAzimuth = azimuthBuild
+        let selectedResolution = resolution
+        let useExtraOptions = enableExtraOptions
+        let useMetalHUD = showMetalHUD
+        let rawGameFolder = gameFolderOverride ?? gameFolderPath
+        let userGameFolder = URL(fileURLWithPath: rawGameFolder).resolvingSymlinksInPath().path
+        let currentEnv = envOverride ?? envStatus
+
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        guard let payloadRoot = Bundle.main.resourceURL?.appendingPathComponent("payload") else {
+            throw NSError(domain: "FH2Launch", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Bundled payload directory is missing from app bundle."
+            ])
+        }
+
+        // 1. Determine bottle / prefix path
+        let bottleURL: URL
+        let isCrossOver = (currentEnv.runtimeKind == .crossover || currentEnv.runtimeKind == .crossoverPreview)
+        if let customBottle = bottleOverrideURL {
+            bottleURL = customBottle
+        } else if isCrossOver {
+            let cxBottlesDir = home.appendingPathComponent("Library/Application Support/CrossOver/Bottles")
+            bottleURL = cxBottlesDir.appendingPathComponent("ForzaHorizon2")
+        } else {
+            let fh2SupportDir = home.appendingPathComponent("Library/Application Support/FH2Port")
+            bottleURL = fh2SupportDir.appendingPathComponent("bottle")
+        }
+
+        let driveCURL = bottleURL.appendingPathComponent("drive_c")
+        let azimuthDirName = "Azimuth"
+        let azimuthDestURL = driveCURL.appendingPathComponent(azimuthDirName)
+
+        // Build runtime environment variables for Wine + D3DMetal
+        var wineEnv = ProcessInfo.processInfo.environment
+        wineEnv["WINEPREFIX"] = bottleURL.path
+        wineEnv["WINEDEBUG"] = "-all"
+        wineEnv["WINEMSYNC"] = "1"
+        wineEnv["WINEESYNC"] = "0"
+        wineEnv["D3DMETAL"] = "1"
+        wineEnv["MTL_HUD_ENABLED"] = useMetalHUD ? "1" : "0"
+        wineEnv["ROSETTA_ADVERTISE_AVX"] = "0"
+
+        if isCrossOver {
+            wineEnv["CX_BOTTLE"] = bottleURL.path
+            wineEnv["CX_GRAPHICS_BACKEND"] = "d3dmetal"
+        } else if let extDir = currentEnv.d3dMetalExternalDir {
+            wineEnv["CX_D3DMETALPATH"] = extDir.path
+            let existingLib = wineEnv["DYLD_FALLBACK_LIBRARY_PATH"] ?? "/usr/local/lib:/usr/lib"
+            let existingFw = wineEnv["DYLD_FALLBACK_FRAMEWORK_PATH"] ?? "/Library/Frameworks:/System/Library/Frameworks"
+            var libPaths = [extDir.path]
+            var fwPaths = [extDir.path]
+
+            if let gptkApp = currentEnv.gptkAppURL {
+                let wineLib = gptkApp.appendingPathComponent("Contents/Resources/wine/lib").path
+                libPaths.append(wineLib)
+            }
+            if let hbRoot = currentEnv.highballRoot {
+                let hbFw = hbRoot.appendingPathComponent("frameworks").path
+                let gstLib = hbRoot.appendingPathComponent("frameworks/GStreamer.framework/Versions/1.0/lib").path
+                libPaths.append(hbFw)
+                libPaths.append(gstLib)
+                fwPaths.append(hbFw)
+            }
+            if let gptkWineDll = currentEnv.gptkWineDllDir {
+                wineEnv["WINEDLLPATH_PREPEND"] = gptkWineDll.path
+            }
+            wineEnv["DYLD_FALLBACK_LIBRARY_PATH"] = (libPaths + [existingLib]).joined(separator: ":")
+            wineEnv["DYLD_FALLBACK_FRAMEWORK_PATH"] = (fwPaths + [existingFw]).joined(separator: ":")
+        }
+
+        guard let wineBin = currentEnv.wineExecutable else {
+            throw NSError(domain: "FH2Launch", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Wine executable not found."
+            ])
+        }
+
+        // 2. Initialize bottle if `system.reg` does not exist yet
+        if !fm.fileExists(atPath: bottleURL.appendingPathComponent("system.reg").path) {
+            self.updateLaunchStatus("Initializing Windows 10 64-bit bottle (first run only)...")
+            try fm.createDirectory(at: bottleURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+            if isCrossOver, let cxbottle = currentEnv.cxBottleExecutable {
+                self.appendLog("Creating CrossOver win10_64 bottle at \(bottleURL.path)")
+                _ = self.runProcess(
+                    executable: cxbottle.path,
+                    args: ["--bottle", bottleURL.path, "--create", "--template", "win10_64"],
+                    env: wineEnv
+                )
+            } else {
+                try fm.createDirectory(at: bottleURL, withIntermediateDirectories: true)
+                self.appendLog("Bootstrapping Wine prefix at \(bottleURL.path) via wineboot -u")
+                _ = self.runProcess(
+                    executable: wineBin.path,
+                    args: ["wineboot", "-u"],
+                    env: wineEnv
+                )
+                if let srv = currentEnv.wineserverExecutable {
+                    _ = self.runProcess(executable: srv.path, args: ["-w"], env: wineEnv)
+                }
+            }
+        }
+
+        try fm.createDirectory(at: azimuthDestURL.appendingPathComponent("data/logs"), withIntermediateDirectories: true)
+
+        // 3. Copy selected Azimuth build (`0.9.10` or `1.0.1`) preserving `data/titles` (saves)
+        self.updateLaunchStatus("Installing Azimuth \(selectedAzimuth.rawValue) + Apple Silicon D3D12 & Gamepad shims...")
+        let bundledAzDir = payloadRoot.appendingPathComponent(selectedAzimuth.payloadSubfolder)
+        guard fm.fileExists(atPath: bundledAzDir.appendingPathComponent("azimuth.exe").path) else {
+            throw NSError(domain: "FH2Launch", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Bundled Azimuth \(selectedAzimuth.rawValue) payload not found at \(bundledAzDir.path)."
+            ])
+        }
+
+        // Use `/usr/bin/ditto` to merge bundled Azimuth into `drive_c/Azimuth` so user saves in `data/titles` are never deleted
+        let (dittoCode, dittoOut) = self.runProcess(
+            executable: "/usr/bin/ditto",
+            args: [bundledAzDir.path, azimuthDestURL.path]
+        )
+        if dittoCode != 0 {
+            throw NSError(domain: "FH2Launch", code: Int(dittoCode), userInfo: [
+                NSLocalizedDescriptionKey: "Failed to copy Azimuth payload: \(dittoOut)"
+            ])
+        }
+
+        // 4. Copy `d3d12.dll`, `fh2pad.dll`, and `d3dcompiler_47.dll` next to `azimuth.exe`
+        let layerDir = payloadRoot.appendingPathComponent("layer")
+        for dll in ["d3d12.dll", "fh2pad.dll", "d3dcompiler_47.dll"] {
+            let src = layerDir.appendingPathComponent(dll)
+            let dst = azimuthDestURL.appendingPathComponent(dll)
+            if fm.fileExists(atPath: src.path) {
+                try? fm.removeItem(at: dst)
+                try fm.copyItem(at: src, to: dst)
+            } else {
+                self.appendLog("Warning: \(dll) missing from \(layerDir.path)")
+            }
+        }
+
+        // 5. Handle Optional `ForzaHorizon2_ExtraOptions` mod
+        let extraOptionsSrc = payloadRoot.appendingPathComponent("extra_options")
+        let winmmDst = azimuthDestURL.appendingPathComponent("winmm.dll")
+        let eoIniDst = azimuthDestURL.appendingPathComponent("FH2_ExtraOptions.ini")
+        let modsDst = azimuthDestURL.appendingPathComponent("mods")
+
+        if useExtraOptions && fm.fileExists(atPath: extraOptionsSrc.appendingPathComponent("winmm.dll").path) {
+            self.appendLog("Enabling ForzaHorizon2_ExtraOptions (Unlock All DLC & Skip Intro Videos)")
+            try? fm.removeItem(at: winmmDst)
+            try fm.copyItem(at: extraOptionsSrc.appendingPathComponent("winmm.dll"), to: winmmDst)
+            if !fm.fileExists(atPath: eoIniDst.path) {
+                try? fm.copyItem(at: extraOptionsSrc.appendingPathComponent("FH2_ExtraOptions.ini"), to: eoIniDst)
+            }
+            if fm.fileExists(atPath: extraOptionsSrc.appendingPathComponent("mods").path) {
+                _ = self.runProcess(
+                    executable: "/usr/bin/ditto",
+                    args: [extraOptionsSrc.appendingPathComponent("mods").path, modsDst.path]
+                )
+            }
+        } else {
+            self.appendLog("ExtraOptions disabled — removing winmm.dll hook if present")
+            try? fm.removeItem(at: winmmDst)
+        }
+
+        // 6. Apply Wine Registry & DLL Overrides (matching `FH2-Port-AppleSilicon/scripts/install.sh`)
+        self.updateLaunchStatus("Applying Wine registry & DLL overrides for Azimuth...")
+        let appKey = #"HKCU\Software\Wine\AppDefaults\azimuth.exe\DllOverrides"#
+        let padKey = #"HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.Input.Gamepad"#
+        let busKey = #"HKLM\System\CurrentControlSet\Services\WineBus"#
+
+        var regCommands: [[String]] = [
+            ["reg", "add", appKey, "/v", "d3d12", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
+            ["reg", "add", appKey, "/v", "d3dcompiler_47", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
+            ["reg", "add", appKey, "/v", "msvcr110", "/t", "REG_SZ", "/d", "native", "/f"],
+            ["reg", "add", appKey, "/v", "msvcp110", "/t", "REG_SZ", "/d", "native", "/f"],
+            ["reg", "add", appKey, "/v", "vcruntime140", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
+            ["reg", "add", appKey, "/v", "vcruntime140_1", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
+            ["reg", "add", appKey, "/v", "msvcp140", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
+            ["reg", "add", appKey, "/v", "concrt140", "/t", "REG_SZ", "/d", "native,builtin", "/f"],
+            ["reg", "add", padKey, "/v", "DllPath", "/t", "REG_SZ", "/d", #"C:\Azimuth\fh2pad.dll"#, "/f"],
+            ["reg", "add", busKey, "/v", "DisableHidraw", "/t", "REG_DWORD", "/d", "1", "/f"]
+        ]
+
+        if useExtraOptions {
+            regCommands.append(["reg", "add", appKey, "/v", "winmm", "/t", "REG_SZ", "/d", "native,builtin", "/f"])
+        } else {
+            regCommands.append(["reg", "delete", appKey, "/v", "winmm", "/f"])
+        }
+
+        for cmd in regCommands {
+            _ = self.runProcess(executable: wineBin.path, args: cmd, env: wineEnv)
+        }
+
+        // 7. Configure `data/azimuth.ini` (UTF-16LE with BOM) with resolution, antialiasing=off, and FH2 game folder path
+        self.updateLaunchStatus("Configuring data/azimuth.ini (\(selectedResolution.rawValue)p, antialiasing=off)...")
+        let iniURL = azimuthDestURL.appendingPathComponent("data/azimuth.ini")
+        let winGamePath = "Z:" + userGameFolder.replacingOccurrences(of: "/", with: "\\")
+        try Self.configureAzimuthIni(
+            at: iniURL,
+            resolution: selectedResolution.rawValue,
+            windowsGamePath: winGamePath,
+            azimuthBuild: selectedAzimuth
+        )
+        self.appendLog("Configured \(iniURL.path) -> folder=\(winGamePath), resolution=\(selectedResolution.rawValue), antialiasing=off")
+
+        // Rotate fh2port.log if present
+        let fh2Log = azimuthDestURL.appendingPathComponent("data/logs/fh2port.log")
+        let fh2PrevLog = azimuthDestURL.appendingPathComponent("data/logs/fh2port.prev.log")
+        if fm.fileExists(atPath: fh2Log.path) {
+            try? fm.removeItem(at: fh2PrevLog)
+            try? fm.moveItem(at: fh2Log, to: fh2PrevLog)
+        }
+
+        // 8. Launch `azimuth.exe` with `--skip-launcher` so it boots directly into Forza Horizon 2!
+        self.updateLaunchStatus("Launching Forza Horizon 2...")
+        let wineLogURL = azimuthDestURL.appendingPathComponent("data/logs/wine.log")
+        fm.createFile(atPath: wineLogURL.path, contents: nil)
+        let logHandle = try? FileHandle(forWritingTo: wineLogURL)
+
+        let proc = Process()
+        proc.executableURL = wineBin
+        proc.currentDirectoryURL = azimuthDestURL
+        proc.arguments = [#"C:\Azimuth\azimuth.exe"#, "--skip-launcher"]
+        proc.environment = wineEnv
+        if let logHandle = logHandle {
+            proc.standardOutput = logHandle
+            proc.standardError = logHandle
+        }
+
+        try proc.run()
+        self.appendLog("Started azimuth.exe (PID \(proc.processIdentifier)) in bottle \(bottleURL.path)")
+        return proc.processIdentifier
     }
 
     private func updateLaunchStatus(_ text: String) {
@@ -1574,7 +1582,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@main
 struct FH2LauncherApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var viewModel = LauncherViewModel()
@@ -1587,3 +1594,242 @@ struct FH2LauncherApp: App {
         .windowResizability(.contentSize)
     }
 }
+
+// MARK: - Automated End-to-End Runtime Self-Test (`--self-test`)
+
+enum SelfTestRunner {
+    static func assertCondition(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+        if !condition() {
+            throw NSError(domain: "FH2SelfTest", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Assertion failed: \(message)"
+            ])
+        }
+        print("[PASS] \(message)")
+    }
+
+    static func run() -> Int32 {
+        print("=== Forza Horizon 2 macOS App — Runtime & Integration Self-Test ===")
+        let fm = FileManager.default
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("fh2-selftest-\(ProcessInfo.processInfo.globallyUniqueString)")
+
+        // Save UserDefaults keys so self-test leaves user preferences untouched
+        let defaults = UserDefaults.standard
+        let savedFolder = defaults.string(forKey: "FH2_GameFolderPath")
+        let savedRes = defaults.string(forKey: "FH2_Resolution")
+        let savedAz = defaults.string(forKey: "FH2_AzimuthBuild")
+        let savedEO = defaults.object(forKey: "FH2_EnableExtraOptions")
+        let savedHUD = defaults.object(forKey: "FH2_ShowMetalHUD")
+
+        defer {
+            try? fm.removeItem(at: tempRoot)
+            if let v = savedFolder { defaults.set(v, forKey: "FH2_GameFolderPath") } else { defaults.removeObject(forKey: "FH2_GameFolderPath") }
+            if let v = savedRes { defaults.set(v, forKey: "FH2_Resolution") } else { defaults.removeObject(forKey: "FH2_Resolution") }
+            if let v = savedAz { defaults.set(v, forKey: "FH2_AzimuthBuild") } else { defaults.removeObject(forKey: "FH2_AzimuthBuild") }
+            if let v = savedEO { defaults.set(v, forKey: "FH2_EnableExtraOptions") } else { defaults.removeObject(forKey: "FH2_EnableExtraOptions") }
+            if let v = savedHUD { defaults.set(v, forKey: "FH2_ShowMetalHUD") } else { defaults.removeObject(forKey: "FH2_ShowMetalHUD") }
+        }
+
+        do {
+            try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+
+            // 1. Verify Bundle Resources & Payload Integrity
+            guard let resURL = Bundle.main.resourceURL else {
+                throw NSError(domain: "FH2SelfTest", code: 2, userInfo: [NSLocalizedDescriptionKey: "Bundle.main.resourceURL is nil"])
+            }
+            let requiredFiles = [
+                "AppIcon.icns",
+                "payload/azimuth-0.9.10/azimuth.exe",
+                "payload/azimuth-1.0.1/azimuth.exe",
+                "payload/layer/d3d12.dll",
+                "payload/layer/fh2pad.dll",
+                "payload/layer/d3dcompiler_47.dll",
+                "payload/extra_options/winmm.dll",
+                "payload/extra_options/FH2_ExtraOptions.ini"
+            ]
+            for rel in requiredFiles {
+                let fileURL = resURL.appendingPathComponent(rel)
+                let exists = fm.fileExists(atPath: fileURL.path)
+                let size = (try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? UInt64) ?? 0
+                try assertCondition(exists && size > 0, "Bundled resource exists and is non-empty: \(rel) (\(size) bytes)")
+            }
+
+            // 2. Verify Live SwiftUI View Hierarchy & AppKit Window Rendering (720 x 520)
+            _ = NSApplication.shared
+            let vm = LauncherViewModel()
+            let mainView = LauncherMainView(vm: vm)
+            let hostingView = NSHostingView(rootView: mainView)
+            hostingView.frame = NSRect(x: 0, y: 0, width: 720, height: 520)
+
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 720, height: 520),
+                styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.titlebarAppearsTransparent = true
+            window.contentView = hostingView
+            hostingView.layoutSubtreeIfNeeded()
+
+            // Exercise UI state transitions & re-layout
+            vm.showLogsDrawer = true
+            vm.isProvisioningRuntime = true
+            vm.provisioningProgress = 0.65
+            vm.provisioningStepText = "Step 2/3: Downloading Apple Silicon DirectX-to-Metal runtime (65%)..."
+            hostingView.layoutSubtreeIfNeeded()
+
+            vm.isProvisioningRuntime = false
+            vm.resolution = .r2160
+            vm.azimuthBuild = .v1_0_1
+            hostingView.layoutSubtreeIfNeeded()
+
+            if let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds) {
+                hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
+                try assertCondition(bitmap.pixelsWide >= 720 && bitmap.pixelsHigh >= 520, "Rendered live 720x520 SwiftUI LauncherMainView to bitmap (\(bitmap.pixelsWide)x\(bitmap.pixelsHigh) px)")
+            } else {
+                try assertCondition(hostingView.bounds.width == 720 && hostingView.bounds.height == 520, "Verified 720x520 SwiftUI NSHostingView layout bounds")
+            }
+
+            // 3. Verify Game Folder Validation (Invalid, Valid, and Symlink Rejection)
+            let emptyGameDir = tempRoot.appendingPathComponent("EmptyGame")
+            try fm.createDirectory(at: emptyGameDir, withIntermediateDirectories: true)
+            vm.gameFolderPath = emptyGameDir.path
+            try assertCondition(!vm.folderValidation.isVerified, "Empty folder is rejected by validateGameFolder()")
+
+            let validGameDir = tempRoot.appendingPathComponent("ForzaHorizon2_v1.0.0.64")
+            let mountDir = validGameDir.appendingPathComponent("Mount")
+            try fm.createDirectory(at: mountDir, withIntermediateDirectories: true)
+            let exeURL = mountDir.appendingPathComponent("forza_durango_release_final.exe")
+            try Data("MZ_MOCK_FH2_EXE".utf8).write(to: exeURL)
+
+            vm.gameFolderPath = validGameDir.path
+            try assertCondition(vm.folderValidation.isVerified, "Valid Forza Horizon 2 folder with Mount/forza_durango_release_final.exe is verified")
+
+            let symlinkGameDir = tempRoot.appendingPathComponent("SymlinkFH2")
+            try fm.createSymbolicLink(at: symlinkGameDir, withDestinationURL: validGameDir)
+            vm.gameFolderPath = symlinkGameDir.path
+            try assertCondition(!vm.folderValidation.isVerified, "Symbolic link game folder is flagged and blocked from launching")
+
+            // Restore valid game folder
+            vm.gameFolderPath = validGameDir.path
+            try assertCondition(vm.folderValidation.isVerified, "Restored valid game folder state")
+
+            // 4. Verify End-to-End Bottle Provisioning, Payload Copy, DLL Injection, Registry Overrides & Azimuth.ini via Mock Wine64
+            let mockBinDir = tempRoot.appendingPathComponent("mock_bin")
+            let mockExtDir = tempRoot.appendingPathComponent("mock_d3dmetal_ext")
+            try fm.createDirectory(at: mockBinDir, withIntermediateDirectories: true)
+            try fm.createDirectory(at: mockExtDir.appendingPathComponent("D3DMetal.framework"), withIntermediateDirectories: true)
+
+            let mockWineLog = tempRoot.appendingPathComponent("mock_wine_calls.log")
+            let mockWineScript = mockBinDir.appendingPathComponent("wine64")
+            let scriptBody = """
+            #!/bin/bash
+            echo "CALL args=[$*] WINEPREFIX=[$WINEPREFIX] D3DMETAL=[$D3DMETAL] AVX=[$ROSETTA_ADVERTISE_AVX] HUD=[$MTL_HUD_ENABLED] DYLD_LIB=[$DYLD_FALLBACK_LIBRARY_PATH]" >> "\(mockWineLog.path)"
+            if [ "$1" = "wineboot" ]; then
+                mkdir -p "$WINEPREFIX/drive_c"
+                echo "WINE REGISTRY Version 2" > "$WINEPREFIX/system.reg"
+            fi
+            exit 0
+            """
+            try Data(scriptBody.utf8).write(to: mockWineScript)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockWineScript.path)
+
+            let mockEnv = RuntimeEnvironment(
+                rosettaInstalled: true,
+                runtimeKind: .gptkStandalone,
+                wineExecutable: mockWineScript,
+                wineserverExecutable: nil,
+                cxBottleExecutable: nil,
+                d3dMetalExternalDir: mockExtDir,
+                gptkWineDllDir: nil,
+                crossoverRoot: nil,
+                highballRoot: nil,
+                gptkAppURL: nil
+            )
+
+            let testBottle = tempRoot.appendingPathComponent("bottle")
+            // Pre-seed a mock save file inside `drive_c/Azimuth/data/titles/1a96545b/save.bin` to verify saves are preserved across launches
+            let mockSaveURL = testBottle.appendingPathComponent("drive_c/Azimuth/data/titles/1a96545b/save.bin")
+            try fm.createDirectory(at: mockSaveURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("USER_SAVE_PROGRESS_DATA".utf8).write(to: mockSaveURL)
+
+            // Run 1: Azimuth 0.9.10, 1440p, ExtraOptions ON, Metal HUD ON
+            vm.azimuthBuild = .v0_9_10
+            vm.resolution = .r1440
+            vm.enableExtraOptions = true
+            vm.showMetalHUD = true
+
+            let pid1 = try vm.executeLaunchSequence(
+                bottleOverrideURL: testBottle,
+                envOverride: mockEnv,
+                gameFolderOverride: validGameDir.path
+            )
+            try assertCondition(pid1 > 0, "executeLaunchSequence (Run 1: Azimuth 0.9.10, 1440p, ExtraOptions=ON) spawned process PID \(pid1)")
+            usleep(250_000)
+
+            let azDest = testBottle.appendingPathComponent("drive_c/Azimuth")
+            for expectedFile in ["azimuth.exe", "d3d12.dll", "fh2pad.dll", "d3dcompiler_47.dll", "winmm.dll", "FH2_ExtraOptions.ini", "data/azimuth.ini", "data/titles/1a96545b/save.bin"] {
+                let p = azDest.appendingPathComponent(expectedFile).path
+                try assertCondition(fm.fileExists(atPath: p), "Bottle file present after Run 1: drive_c/Azimuth/\(expectedFile)")
+            }
+
+            let iniURL = azDest.appendingPathComponent("data/azimuth.ini")
+            let iniRaw = try Data(contentsOf: iniURL)
+            try assertCondition(iniRaw.prefix(2) == Data([0xFF, 0xFE]), "data/azimuth.ini starts with UTF-16LE BOM (0xFF 0xFE)")
+            let iniText = String(data: Data(iniRaw.dropFirst(2)), encoding: .utf16LittleEndian) ?? ""
+            try assertCondition(iniText.contains("game=1a96545b"), "azimuth.ini contains game=1a96545b")
+            try assertCondition(iniText.contains("antialiasing=off"), "azimuth.ini contains antialiasing=off")
+            try assertCondition(iniText.contains("resolution=1440"), "azimuth.ini contains resolution=1440")
+            try assertCondition(iniText.contains("[title-1a96545b]"), "azimuth.ini contains [title-1a96545b]")
+
+            let wineCalls = (try? String(contentsOf: mockWineLog, encoding: .utf8)) ?? ""
+            try assertCondition(wineCalls.contains("wineboot -u"), "wineboot -u executed on fresh bottle")
+            try assertCondition(wineCalls.contains("d3d12 /t REG_SZ /d native,builtin"), "Wine DLL override set for d3d12")
+            try assertCondition(wineCalls.contains("d3dcompiler_47 /t REG_SZ /d native,builtin"), "Wine DLL override set for d3dcompiler_47")
+            try assertCondition(wineCalls.contains(#"Windows.Gaming.Input.Gamepad /v DllPath /t REG_SZ /d C:\Azimuth\fh2pad.dll"#), "fh2pad.dll registered for Windows.Gaming.Input.Gamepad")
+            try assertCondition(wineCalls.contains("DisableHidraw /t REG_DWORD /d 1"), "WineBus DisableHidraw=1 configured")
+            try assertCondition(wineCalls.contains("winmm /t REG_SZ /d native,builtin"), "ExtraOptions winmm override configured")
+            try assertCondition(wineCalls.contains(#"args=[C:\Azimuth\azimuth.exe --skip-launcher]"#) && wineCalls.contains("D3DMETAL=[1] AVX=[0] HUD=[1]"), "azimuth.exe --skip-launcher launched with D3DMETAL=1, ROSETTA_ADVERTISE_AVX=0, MTL_HUD_ENABLED=1")
+
+            // Run 2: Switch to Azimuth 1.0.1, 2160p, ExtraOptions OFF, Metal HUD OFF
+            vm.azimuthBuild = .v1_0_1
+            vm.resolution = .r2160
+            vm.enableExtraOptions = false
+            vm.showMetalHUD = false
+
+            let pid2 = try vm.executeLaunchSequence(
+                bottleOverrideURL: testBottle,
+                envOverride: mockEnv,
+                gameFolderOverride: validGameDir.path
+            )
+            try assertCondition(pid2 > 0, "executeLaunchSequence (Run 2: Azimuth 1.0.1, 2160p, ExtraOptions=OFF) spawned process PID \(pid2)")
+            usleep(250_000)
+
+            try assertCondition(!fm.fileExists(atPath: azDest.appendingPathComponent("winmm.dll").path), "winmm.dll cleanly removed when ExtraOptions is toggled OFF")
+            try assertCondition(fm.fileExists(atPath: mockSaveURL.path), "User save data in data/titles/1a96545b/save.bin preserved across Azimuth version switch")
+            try assertCondition(fm.fileExists(atPath: iniURL.appendingPathExtension("bak-fh2port").path), "azimuth.ini.bak-fh2port backup created before in-place update")
+
+            let iniRaw2 = try Data(contentsOf: iniURL)
+            let iniText2 = String(data: Data(iniRaw2.dropFirst(2)), encoding: .utf16LittleEndian) ?? ""
+            try assertCondition(iniText2.contains("resolution=2160") && iniText2.contains("antialiasing=off"), "azimuth.ini updated in-place to resolution=2160 and antialiasing=off")
+
+            print("=== ALL SELF-TESTS PASSED SUCCESSFULLY (0 ERRORS) ===")
+            return 0
+        } catch {
+            fputs("[FAIL] Self-test error: \(error.localizedDescription)\n", stderr)
+            return 1
+        }
+    }
+}
+
+@main
+enum LauncherEntryPoint {
+    static func main() {
+        if CommandLine.arguments.contains("--self-test") {
+            exit(SelfTestRunner.run())
+        } else {
+            FH2LauncherApp.main()
+        }
+    }
+}
+
