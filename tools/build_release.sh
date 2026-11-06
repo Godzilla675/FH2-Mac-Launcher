@@ -37,11 +37,15 @@ mkdir -p "$APP_BUNDLE/Contents/Resources/payload/azimuth-0.9.10"
 mkdir -p "$APP_BUNDLE/Contents/Resources/payload/azimuth-1.0.1"
 mkdir -p "$APP_BUNDLE/Contents/Resources/payload/extra_options"
 
-SEVENZIP_TAR="$SCRATCH/7z2408-mac.tar.xz"
-curl -fsSL --retry 3 "https://www.7-zip.org/a/7z2408-mac.tar.xz" -o "$SEVENZIP_TAR"
-mkdir -p "$SCRATCH/7z_mac"
-tar -xJf "$SEVENZIP_TAR" -C "$SCRATCH/7z_mac"
-cp "$SCRATCH/7z_mac/7zz" "$APP_BUNDLE/Contents/Resources/bin/7zz"
+SEVENZIP_TAR="$SCRATCH/7z-mac.tar.xz"
+if curl -fsSL --retry 3 "https://github.com/ip7z/7zip/releases/download/26.05/7z2605-mac.tar.xz" -o "$SEVENZIP_TAR" || \
+   curl -fsSL --retry 3 "https://www.7-zip.org/a/7z2605-mac.tar.xz" -o "$SEVENZIP_TAR"; then
+    mkdir -p "$SCRATCH/7z_mac"
+    tar -xJf "$SEVENZIP_TAR" -C "$SCRATCH/7z_mac"
+    cp "$SCRATCH/7z_mac/7zz" "$APP_BUNDLE/Contents/Resources/bin/7zz"
+else
+    cp "$(command -v 7zz)" "$APP_BUNDLE/Contents/Resources/bin/7zz"
+fi
 chmod +x "$APP_BUNDLE/Contents/Resources/bin/7zz"
 
 cp "$REPO_ROOT/manifest.json" "$APP_BUNDLE/Contents/Resources/manifest.json"
