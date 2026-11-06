@@ -59,12 +59,5 @@ jobs:
               "dist/Forza-Horizon-2-Setup.dmg" \
               "dist/Forza-Horizon-2-Mac-App.zip" \
               --title "Forza Horizon 2 — macOS Apple Silicon Installer & Launcher (v1.0.0)" \
-              --notes "Turnkey native macOS SwiftUI installer and launcher for **Forza Horizon 2 (Xbox One v1.0.0.64)** on Apple Silicon Macs (M1/M2/M3/M4/M5).
-
-### Bundled Inside \`Forza Horizon 2.app/Contents/Resources/payload/\`
-- **\`d3d12.dll\` & \`fh2pad.dll\`** compiled from \`fladnaG86/FH2-Port-AppleSilicon\` (D3D12 heap/MSAA8/fiber/VirtualAlloc2/mprotect layer + WinRT Gamepad & keyboard provider).
-- **\`d3dcompiler_47.dll\`** (Microsoft HLSL compiler extracted from Firefox 62.0 win64).
-- **Azimuth \`0.9.10\` (Default) & \`1.0.1\`** pre-bundled.
-- **\`ForzaHorizon2_ExtraOptions\` (v0.4.4)** pre-bundled with a UI toggle to unlock all DLC cars and skip intro videos.
-- **100% Free Graphics Runtime Support**: Supports free **Game Porting Toolkit (\`D3DMetal\`)**, **Highball**, and **CrossOver** out of the box with one-click in-app runtime provisioning."
+              --notes-file README.md
           fi
