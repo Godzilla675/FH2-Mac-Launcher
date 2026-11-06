@@ -2418,11 +2418,12 @@ enum SelfTestRunner {
                 "Downloaded first 1 MB (1,048,576 bytes) of FH2-Game.zip from Google Drive and verified PK\\x03\\x04 zip magic bytes"
             )
 
-            // Verify byte-exact resume (`curl -C -` / range 1048576..2097151) for the next 1 MB
+            // Verify byte-exact range resume (bytes 1048576..2097151) for the next 1 MB
             let driveChunk2 = tempRoot.appendingPathComponent("fh2_drive_chunk2.bin")
+            let resolvedDriveURL2 = LauncherViewModel.resolveGoogleDriveDownloadURL(fileID: manifest.gameFileID)
             let (c2Code, _) = vm.runProcess(
                 executable: "/usr/bin/curl",
-                args: ["-fsSL", "--retry", "3", "-C", "1048576", "-r", "1048576-2097151", "-o", driveChunk2.path, resolvedDriveURL]
+                args: ["-fsSL", "--retry", "3", "--range", "1048576-2097151", "-o", driveChunk2.path, resolvedDriveURL2]
             )
             if let chunk2Data = try? Data(contentsOf: driveChunk2), let handle = try? FileHandle(forWritingTo: drivePartTest) {
                 handle.seekToEndOfFile()
