@@ -2520,6 +2520,12 @@ enum SelfTestRunner {
             let testBottle = tempRoot.appendingPathComponent("bottle")
             let testFinalGameDir = tempRoot.appendingPathComponent("Games/Forza Horizon 2")
 
+            // Pre-seed 50% of `FH2-Game.zip.part` on disk to verify `downloadWithAutoResume` (`curl -L -C -`) resumes from 50% -> 100%
+            try fm.createDirectory(at: testCacheDir, withIntermediateDirectories: true)
+            let fullMockData = try Data(contentsOf: mockGameZip)
+            let halfCount = max(4, fullMockData.count / 2)
+            try fullMockData.prefix(halfCount).write(to: testCacheDir.appendingPathComponent("FH2-Game.zip.part"))
+
             try vm.executeFourStepSetupPipeline(
                 customCacheDir: testCacheDir,
                 customBottleURL: testBottle,
