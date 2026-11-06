@@ -1,6 +1,6 @@
 # Forza Horizon 2 — macOS Apple Silicon Installer & Launcher
 
-A turnkey, native macOS SwiftUI installer and launcher app (`Forza Horizon 2.app`) that allows non-technical users to install and play **Forza Horizon 2 (Xbox One v1.0.0.64)** on Apple Silicon Macs (M1 / M2 / M3 / M4 / M5) for **100% free** using Apple's `D3DMetal` (Game Porting Toolkit / Highball) or CrossOver.
+A turnkey, native macOS SwiftUI installer and launcher app (`Forza Horizon 2.app`) that allows users to install and play **Forza Horizon 2 (Xbox One v1.0.0.64)** on Apple Silicon Macs (M1 / M2 / M3 / M4 / M5) for **100% free** using Apple's `D3DMetal` (Game Porting Toolkit / Highball) or CrossOver.
 
 ## Features
 
@@ -12,5 +12,3 @@ A turnkey, native macOS SwiftUI installer and launcher app (`Forza Horizon 2.app
   - **`d3dcompiler_47.dll`**: Microsoft's native 64-bit shader compiler (extracted from Firefox 62.0 win64) so Azimuth's GPU detile shaders compile cleanly.
   - **Azimuth (`0.9.10` Default & `1.0.1`)**: Both builds pre-bundled and selectable via the UI.
   - **Optional DLC & QoL Mod (`ForzaHorizon2_ExtraOptions` v0.4.4)**: Bundled from [`RokkuDayo/ForzaHorizon2_ExtraOptions`](https://github.com/RokkuDayo/ForzaHorizon2_ExtraOptions) with a one-click UI switch to unlock all DLC cars and skip intro videos.
-- **"Kaggle-Like Mono UI"**:
-  - Clean `720 x 520` pt native SwiftUI window with `#20BEFF` cyan-blue accents, monospace telemetry badges, live `GCController` gamepad detection, automatic game folder verification, and a collapsible logs drawer.
