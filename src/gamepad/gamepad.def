@@ -1,0 +1,4 @@
+LIBRARY fh2pad.dll
+EXPORTS
+DllGetActivationFactory
+DllCanUnloadNow

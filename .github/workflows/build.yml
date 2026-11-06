@@ -1,0 +1,70 @@
+name: Build & Release Forza Horizon 2 macOS App
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install mingw-w64 and sevenzip
+        run: |
+          brew install mingw-w64 sevenzip
+
+      - name: Build DLLs, SwiftUI App, Icon, DMG and ZIP
+        run: |
+          chmod +x tools/build_release.sh
+          ./tools/build_release.sh 1.0.0
+
+      - name: Verify App Bundle Payload and Code Signature
+        run: |
+          ls -la "dist/Forza Horizon 2.app/Contents/MacOS/FH2Launcher"
+          ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/"
+          ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/azimuth-0.9.10/"
+          ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/azimuth-1.0.1/"
+          ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/extra_options/"
+          codesign --verify --deep --strict "dist/Forza Horizon 2.app"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Forza-Horizon-2-macOS-Release
+          path: |
+            dist/Forza-Horizon-2-Mac-Installer.dmg
+            dist/Forza-Horizon-2-Setup.dmg
+            dist/Forza-Horizon-2-Mac-App.zip
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.0"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "dist/Forza-Horizon-2-Mac-Installer.dmg" \
+              "dist/Forza-Horizon-2-Setup.dmg" \
+              "dist/Forza-Horizon-2-Mac-App.zip" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              "dist/Forza-Horizon-2-Mac-Installer.dmg" \
+              "dist/Forza-Horizon-2-Setup.dmg" \
+              "dist/Forza-Horizon-2-Mac-App.zip" \
+              --title "Forza Horizon 2 — macOS Apple Silicon Installer & Launcher (v1.0.0)" \
+              --notes "Turnkey native macOS SwiftUI installer and launcher for **Forza Horizon 2 (Xbox One v1.0.0.64)** on Apple Silicon Macs (M1/M2/M3/M4/M5).
+
+### Bundled Inside \`Forza Horizon 2.app/Contents/Resources/payload/\`
+- **\`d3d12.dll\` & \`fh2pad.dll\`** compiled from \`fladnaG86/FH2-Port-AppleSilicon\` (D3D12 heap/MSAA8/fiber/VirtualAlloc2/mprotect layer + WinRT Gamepad & keyboard provider).
+- **\`d3dcompiler_47.dll\`** (Microsoft HLSL compiler extracted from Firefox 62.0 win64).
+- **Azimuth \`0.9.10\` (Default) & \`1.0.1\`** pre-bundled.
+- **\`ForzaHorizon2_ExtraOptions\` (v0.4.4)** pre-bundled with a UI toggle to unlock all DLC cars and skip intro videos.
+- **100% Free Graphics Runtime Support**: Supports free **Game Porting Toolkit (\`D3DMetal\`)**, **Highball**, and **CrossOver** out of the box with one-click in-app runtime provisioning."
+          fi
