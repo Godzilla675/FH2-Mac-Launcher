@@ -1,0 +1,17 @@
+{
+  "version": "1.1.0",
+  "game_archive": {
+    "file_id": "1VVmQ3d_qHOj6UhPfslSgeaBfQbc3zYcf",
+    "filename": "FH2-Game.zip",
+    "size_bytes": 18001002054,
+    "share_url": "https://drive.google.com/file/d/1VVmQ3d_qHOj6UhPfslSgeaBfQbc3zYcf/view?usp=sharing",
+    "direct_download_url": "https://drive.usercontent.google.com/download?id=1VVmQ3d_qHOj6UhPfslSgeaBfQbc3zYcf&export=download&confirm=t",
+    "unpacked_target_bytes": 42949672960
+  },
+  "graphics_runtime": {
+    "name": "Game Porting Toolkit (Wine64 + Apple D3DMetal)",
+    "github_releases_api": "https://api.github.com/repos/Gcenx/game-porting-toolkit/releases/latest",
+    "fallback_download_url": "https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-3.0-3/game-porting-toolkit-3.0-3.tar.xz",
+    "expected_size_bytes": 515000000
+  }
+}

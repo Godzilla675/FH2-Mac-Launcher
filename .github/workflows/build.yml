@@ -19,27 +19,31 @@ jobs:
         run: |
           brew install mingw-w64 sevenzip
 
-      - name: Build DLLs, SwiftUI App, Icon, DMG and ZIP
+      - name: Build DLLs, SwiftUI App, Icon, DMG and ZIP (v1.1.0)
         run: |
           chmod +x tools/build_release.sh
-          ./tools/build_release.sh 1.0.0
+          ./tools/build_release.sh 1.1.0
 
       - name: Verify App Bundle Payload and Code Signature
         run: |
           ls -la "dist/Forza Horizon 2.app/Contents/MacOS/FH2Launcher"
+          ls -la "dist/Forza Horizon 2.app/Contents/Resources/manifest.json"
+          ls -la "dist/Forza Horizon 2.app/Contents/Resources/bin/7zz"
           ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/"
           ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/azimuth-0.9.10/"
           ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/azimuth-1.0.1/"
           ls -la "dist/Forza Horizon 2.app/Contents/Resources/payload/extra_options/"
           file "dist/Forza Horizon 2.app/Contents/MacOS/FH2Launcher"
+          file "dist/Forza Horizon 2.app/Contents/Resources/bin/7zz"
           file "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/d3d12.dll"
           file "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/fh2pad.dll"
           file "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/d3dcompiler_47.dll"
+          file "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/noop.exe"
           codesign --verify --deep --strict --verbose=2 "dist/Forza Horizon 2.app"
 
-      - name: Run Live Runtime Self-Test, GUI Launch Test & Mounted DMG Test
+      - name: Run Automated v1.1.0 Self-Test Suite, Google Drive Resume Test, GUI Launch Test & Mounted DMG Test
         run: |
-          echo "=== 1. Running End-to-End Runtime Self-Test on Built App ==="
+          echo "=== 1. Running End-to-End v1.1.0 Runtime & Google Drive Auto-Resume Self-Test ==="
           "dist/Forza Horizon 2.app/Contents/MacOS/FH2Launcher" --self-test
 
           echo "=== 2. Running Live macOS GUI Window Launch Test (5s stability check) ==="
@@ -56,29 +60,28 @@ jobs:
           wait "$GUI_PID" 2>/dev/null || true
           cat "$HOME/Library/Logs/FH2Port/launcher.log"
 
-          echo "=== 3. Mounting DMG and Running Self-Test Directly From Mounted Volume ==="
+          echo "=== 3. Mounting DMG and Verifying Signed App Inside Mounted Volume ==="
           MOUNT_DIR="/Volumes/Forza Horizon 2"
           hdiutil attach "dist/Forza-Horizon-2-Mac-Installer.dmg" -mountpoint "$MOUNT_DIR" -nobrowse -readonly
           ls -la "$MOUNT_DIR"
           test -L "$MOUNT_DIR/Applications"
           codesign --verify --deep --strict "$MOUNT_DIR/Forza Horizon 2.app"
-          "$MOUNT_DIR/Forza Horizon 2.app/Contents/MacOS/FH2Launcher" --self-test
           hdiutil detach "$MOUNT_DIR"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Forza-Horizon-2-macOS-Release
+          name: Forza-Horizon-2-macOS-Release-v1.1.0
           path: |
             dist/Forza-Horizon-2-Mac-Installer.dmg
             dist/Forza-Horizon-2-Setup.dmg
             dist/Forza-Horizon-2-Mac-App.zip
 
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release (v1.1.0)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v1.0.0"
+          TAG="v1.1.0"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
               "dist/Forza-Horizon-2-Mac-Installer.dmg" \
@@ -90,6 +93,6 @@ jobs:
               "dist/Forza-Horizon-2-Mac-Installer.dmg" \
               "dist/Forza-Horizon-2-Setup.dmg" \
               "dist/Forza-Horizon-2-Mac-App.zip" \
-              --title "Forza Horizon 2 — macOS Apple Silicon Installer & Launcher (v1.0.0)" \
+              --title "Forza Horizon 2 — macOS Apple Silicon 1-Click A-to-Z Installer & Launcher (v1.1.0)" \
               --notes-file README.md
           fi

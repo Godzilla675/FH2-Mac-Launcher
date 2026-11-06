@@ -1,14 +1,21 @@
-# Forza Horizon 2 — macOS Apple Silicon Installer & Launcher
+# Forza Horizon 2 — macOS Apple Silicon 1-Click A-to-Z Installer & Launcher (`v1.1.0`)
 
-A turnkey, native macOS SwiftUI installer and launcher app (`Forza Horizon 2.app`) that allows users to install and play **Forza Horizon 2 (Xbox One v1.0.0.64)** on Apple Silicon Macs (M1 / M2 / M3 / M4 / M5) for **100% free** using Apple's `D3DMetal` (Game Porting Toolkit / Highball) or CrossOver.
+A native macOS SwiftUI turnkey A-to-Z installer and launcher (`Forza Horizon 2.app`) engineered for Apple Silicon Macs (M1 / M2 / M3 / M4 / M5). Designed for non-technical users on a brand-new Mac out of the box—no Homebrew, no Xcode Command Line Tools, and no manual terminal commands required.
 
-## Features
+---
 
-- **100% Free Wine + D3DMetal Engine Strategy**:
-  - Automatically detects **CrossOver.app**, **Highball**, or **Game Porting Toolkit.app** (`gcenx/wine/game-porting-toolkit`).
-  - Includes a one-click **"Set Up Free Runtime"** button that silently provisions Rosetta 2 and the free Wine64 + Apple `D3DMetal.framework` graphics runtime in the background with live progress updates—never opening Terminal.app and never invalidating Apple's `anchor apple` signature on `D3DMetal.framework` / `libd3dshared.dylib`.
-- **All-in-One Bundled Payload (`Contents/Resources/payload/`)**:
-  - **`d3d12.dll` & `fh2pad.dll`**: Compiled from [`fladnaG86/FH2-Port-AppleSilicon`](https://github.com/fladnaG86/FH2-Port-AppleSilicon) (`OpenExistingHeapFromAddress` emulation, 8x→4x MSAA showroom cap, `D3D12_APPEND_ALIGNED_ELEMENT` per-slot layout fix, inline `gs:[0x20]` fiber read patch, `NtFlushProcessWriteBuffers` `mprotect` serialization, `NtAllocateVirtualMemoryEx` high-range placement, and `Windows.Gaming.Input.Gamepad` DualSense/Xbox/Keyboard merger).
-  - **`d3dcompiler_47.dll`**: Microsoft's native 64-bit shader compiler (extracted from Firefox 62.0 win64) so Azimuth's GPU detile shaders compile cleanly.
-  - **Azimuth (`0.9.10` Default & `1.0.1`)**: Both builds pre-bundled and selectable via the UI.
-  - **Optional DLC & QoL Mod (`ForzaHorizon2_ExtraOptions` v0.4.4)**: Bundled from [`RokkuDayo/ForzaHorizon2_ExtraOptions`](https://github.com/RokkuDayo/ForzaHorizon2_ExtraOptions) with a one-click UI switch to unlock all DLC cars and skip intro videos.
+## What's New in `v1.1.0` ("1-Click A-to-Z Edition")
+
+1. **Zero-Dependency Brand-New Mac Setup (`Step 1/4`):**
+   - Automatically checks and installs **Rosetta 2** if missing.
+   - Directly downloads and extracts **Game Porting Toolkit (`Wine64` + Apple-signed `D3DMetal.framework`)** into `~/Applications/Game Porting Toolkit.app` without requiring Homebrew or Xcode Command Line Tools, while also supporting CrossOver and Highball if already installed.
+2. **Bulletproof Auto-Resumable 16.8 GB Cloud Downloader (`Step 2/4`):**
+   - Automatically resolves Google Drive's large-file confirmation token (`uuid` / `at`) for `FH2-Game.zip` (`1VVmQ3d_qHOj6UhPfslSgeaBfQbc3zYcf`, `18,001,002,054` bytes) and streams to `~/Games/FH2_Setup_Cache/FH2-Game.zip.part`.
+   - Uses `curl -L -C - --retry 999 --retry-delay 5 --retry-all-errors --connect-timeout 15` inside an automatic token-refresh retry loop so if Wi-Fi drops, the internet disconnects, or the app is closed and reopened, the download resumes from the exact byte offset on disk without ever restarting from 0%.
+3. **Bundled `7zz` Extraction & Silent 40 GB Game Unpacking (`Step 3/4`):**
+   - Bundles static macOS Universal `7zz` (`Contents/Resources/bin/7zz`) to extract `FH2-Game.zip` into a bracket-free staging path (`drive_c/fg_setup`) and immediately deletes `FH2-Game.zip` to save 17 GB of disk space.
+   - Neutralizes `_Redist/QuickSFV.exe` and `MD5/QuickSFV.EXE` with a silent Windows no-op executable (`noop.exe`) so the installer never hangs at 100% waiting for an MD5 checksum window.
+   - Configures Wine as `winxp64` for FreeArc/LOLZ/XTool decompression stability, runs `setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /DIR="C:\FH2Game"` while displaying live GB and percentage progress (`du -sk`), moves the unpacked game to `~/Games/Forza Horizon 2`, deletes `drive_c/fg_setup`, and restores the bottle to `win10`.
+4. **Automatic Azimuth + Apple Silicon D3D12 & Controller Configuration (`Step 4/4`):**
+   - Bundles clean **Azimuth `0.9.10`** (default) and **`1.0.1`**, custom **`d3d12.dll`** (fiber `gs:[0x20]` patch + 4x MSAA cap), **`fh2pad.dll`** (`Windows.Gaming.Input.Gamepad` provider + `WineBus` `DisableHidraw=1`), **`d3dcompiler_47.dll`**, and **`ForzaHorizon2_ExtraOptions`**.
+   - Pre-fills `drive_c/Azimuth/data/azimuth.ini` (UTF-16LE with BOM) with the unpacked game folder path, `antialiasing=off`, and `resolution=1440`, and launches `azimuth.exe --skip-launcher` with `D3DMETAL=1` and `ROSETTA_ADVERTISE_AVX=0`.

@@ -3,7 +3,7 @@ CC = x86_64-w64-mingw32-gcc
 CFLAGS = -O2 -Wall
 OUT = build
 
-all: $(OUT)/d3d12.dll $(OUT)/fh2pad.dll
+all: $(OUT)/d3d12.dll $(OUT)/fh2pad.dll $(OUT)/noop.exe
 
 tools: $(OUT)/fh2test.exe $(OUT)/padtest.exe $(OUT)/dxbcdis.exe
 
@@ -15,6 +15,9 @@ $(OUT)/d3d12.dll: src/d3d12/d3d12.c src/d3d12/d3d12.def | $(OUT)
 
 $(OUT)/fh2pad.dll: src/gamepad/gamepad.c src/gamepad/gamepad.def | $(OUT)
 	$(CC) $(CFLAGS) -shared -static-libgcc -o $@ $^ -luuid
+
+$(OUT)/noop.exe: src/noop/noop.c | $(OUT)
+	$(CC) $(CFLAGS) -s -mwindows -o $@ $<
 
 $(OUT)/fh2test.exe: tools/fh2test.c | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $<

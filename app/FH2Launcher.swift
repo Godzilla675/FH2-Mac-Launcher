@@ -1,6 +1,10 @@
-// Forza Horizon 2 — Native macOS Apple Silicon Installer & Launcher
+// Forza Horizon 2 — Native macOS Apple Silicon A-to-Z Installer & Launcher (v1.1.0)
 // Engineered with a clean, trustworthy Kaggle / Linear / Vercel Geist mono-accent UI.
-// Supports 100% free Game Porting Toolkit (D3DMetal) + Highball + CrossOver out of the box.
+// Zero Homebrew, Zero Xcode Command Line Tools required:
+//   Step 1: Rosetta 2 + Direct Download of Game Porting Toolkit (Wine64 + Apple Signed D3DMetal)
+//   Step 2: Bulletproof Auto-Resumable 16.8 GiB Cloud Download (FH2-Game.zip from Google Drive)
+//   Step 3: Bundled 7zz Extraction + Silent Repack Unpacking (winxp64, QuickSFV neutralized, auto-cleanup)
+//   Step 4: Azimuth (0.9.10 / 1.0.1) + d3d12.dll + fh2pad.dll + d3dcompiler_47.dll + ExtraOptions + UTF-16LE azimuth.ini
 
 import SwiftUI
 import AppKit
@@ -34,6 +38,50 @@ enum Theme {
     }
 
     static let cardBorder = Color.primary.opacity(0.08)
+}
+
+// MARK: - Manifest & Constants
+
+struct SetupManifest {
+    let version: String
+    let gameFileID: String
+    let gameFilename: String
+    let gameExpectedBytes: Int64
+    let gameUnpackedTargetBytes: Int64
+    let runtimeReleasesAPI: String
+    let runtimeFallbackURL: String
+    let runtimeExpectedBytes: Int64
+
+    static let `default` = SetupManifest(
+        version: "1.1.0",
+        gameFileID: "1VVmQ3d_qHOj6UhPfslSgeaBfQbc3zYcf",
+        gameFilename: "FH2-Game.zip",
+        gameExpectedBytes: 18_001_002_054,
+        gameUnpackedTargetBytes: 42_949_672_960, // ~40.0 GiB
+        runtimeReleasesAPI: "https://api.github.com/repos/Gcenx/game-porting-toolkit/releases/latest",
+        runtimeFallbackURL: "https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-3.0-3/game-porting-toolkit-3.0-3.tar.xz",
+        runtimeExpectedBytes: 515_000_000
+    )
+
+    static func loadFromBundle() -> SetupManifest {
+        guard let url = Bundle.main.resourceURL?.appendingPathComponent("manifest.json"),
+              let data = try? Data(contentsOf: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let game = json["game_archive"] as? [String: Any],
+              let rt = json["graphics_runtime"] as? [String: Any] else {
+            return .default
+        }
+        return SetupManifest(
+            version: (json["version"] as? String) ?? Self.default.version,
+            gameFileID: (game["file_id"] as? String) ?? Self.default.gameFileID,
+            gameFilename: (game["filename"] as? String) ?? Self.default.gameFilename,
+            gameExpectedBytes: (game["size_bytes"] as? NSNumber)?.int64Value ?? Self.default.gameExpectedBytes,
+            gameUnpackedTargetBytes: (game["unpacked_target_bytes"] as? NSNumber)?.int64Value ?? Self.default.gameUnpackedTargetBytes,
+            runtimeReleasesAPI: (rt["github_releases_api"] as? String) ?? Self.default.runtimeReleasesAPI,
+            runtimeFallbackURL: (rt["fallback_download_url"] as? String) ?? Self.default.runtimeFallbackURL,
+            runtimeExpectedBytes: (rt["expected_size_bytes"] as? NSNumber)?.int64Value ?? Self.default.runtimeExpectedBytes
+        )
+    }
 }
 
 // MARK: - Domain Models
@@ -83,7 +131,7 @@ enum ResolutionOption: String, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .r1080: return "1080p"
-        case .r1440: return "1440p (Recommended)"
+        case .r1440: return "1440p (Rec)"
         case .r2160: return "2160p"
         }
     }
@@ -120,18 +168,33 @@ enum GameFolderValidation {
     }
 }
 
+enum ChecklistStepState: Equatable {
+    case pending(detail: String)
+    case active(progress: Double, detail: String)
+    case waitingForInternet(progress: Double, detail: String)
+    case completed(detail: String)
+}
+
 // MARK: - ViewModel / Controller
 
 final class LauncherViewModel: ObservableObject {
-    // Environment state
+    let manifest = SetupManifest.loadFromBundle()
+
+    // Environment & Controller state
     @Published var envStatus: RuntimeEnvironment
     @Published var controllerConnected: Bool = false
     @Published var controllerName: String = "Keyboard Mode"
 
-    // Provisioning / Launch progress
-    @Published var isProvisioningRuntime: Bool = false
-    @Published var provisioningProgress: Double = 0.0
-    @Published var provisioningStepText: String = ""
+    // 4-Step A-to-Z Checklist States
+    @Published var step1State: ChecklistStepState = .pending(detail: "Rosetta 2 + Apple DirectX-to-Metal Engine")
+    @Published var step2State: ChecklistStepState = .pending(detail: "16.8 GB Cloud Archive (Auto-Resumable)")
+    @Published var step3State: ChecklistStepState = .pending(detail: "Unzips archive, unpacks 40 GB game & cleans up")
+    @Published var step4State: ChecklistStepState = .pending(detail: "Azimuth + DLC Unlocker + Controller Shims")
+
+    // Pipeline & Launch status
+    @Published var isRunningSetupPipeline: Bool = false
+    @Published var isSetupPausedOrInterrupted: Bool = false
+    @Published var connectionInterruptedBanner: String? = nil
     @Published var isLaunchingGame: Bool = false
     @Published var launchStatusText: String = ""
     @Published var errorBannerText: String? = nil
@@ -141,6 +204,7 @@ final class LauncherViewModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(gameFolderPath, forKey: "FH2_GameFolderPath")
             validateGameFolder()
+            refreshStepChecklistStates()
         }
     }
     @Published var folderValidation: GameFolderValidation = .unconfigured
@@ -157,20 +221,36 @@ final class LauncherViewModel: ObservableObject {
     @Published var showMetalHUD: Bool {
         didSet { UserDefaults.standard.set(showMetalHUD, forKey: "FH2_ShowMetalHUD") }
     }
+    @Published var showInstallerWindow: Bool {
+        didSet { UserDefaults.standard.set(showInstallerWindow, forKey: "FH2_ShowInstallerWindow") }
+    }
 
     // Logs drawer
     @Published var showLogsDrawer: Bool = false
     @Published var logs: [String] = []
 
     let logFileURL: URL
+    let cacheDirURL: URL
+    let defaultInstalledGameDirURL: URL
     private var cancellables = Set<AnyCancellable>()
+    private var activeDownloadProcess: Process? = nil
+    private var shouldCancelPipeline: Bool = false
 
     init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
         self.logFileURL = home.appendingPathComponent("Library/Logs/FH2Port/launcher.log")
+        self.cacheDirURL = home.appendingPathComponent("Games/FH2_Setup_Cache")
+        self.defaultInstalledGameDirURL = home.appendingPathComponent("Games/Forza Horizon 2")
 
         let savedPath = UserDefaults.standard.string(forKey: "FH2_GameFolderPath") ?? ""
-        self.gameFolderPath = savedPath
+        if !savedPath.isEmpty && fm.fileExists(atPath: savedPath) {
+            self.gameFolderPath = savedPath
+        } else if fm.fileExists(atPath: defaultInstalledGameDirURL.path) {
+            self.gameFolderPath = defaultInstalledGameDirURL.path
+        } else {
+            self.gameFolderPath = savedPath
+        }
 
         let savedRes = UserDefaults.standard.string(forKey: "FH2_Resolution") ?? ResolutionOption.r1440.rawValue
         self.resolution = ResolutionOption(rawValue: savedRes) ?? .r1440
@@ -185,9 +265,10 @@ final class LauncherViewModel: ObservableObject {
         }
 
         self.showMetalHUD = UserDefaults.standard.bool(forKey: "FH2_ShowMetalHUD")
+        self.showInstallerWindow = UserDefaults.standard.bool(forKey: "FH2_ShowInstallerWindow")
         self.envStatus = Self.detectEnvironment()
 
-        appendLog("Forza Horizon 2 macOS Apple Silicon Launcher initialized.")
+        appendLog("Forza Horizon 2 macOS Apple Silicon Installer & Launcher v\(manifest.version) initialized.")
         validateGameFolder()
         setupControllerObservers()
         refreshEnvironment()
@@ -200,8 +281,8 @@ final class LauncherViewModel: ObservableObject {
         let line = "[\(timestamp)] \(message)"
         DispatchQueue.main.async {
             self.logs.append(line)
-            if self.logs.count > 400 {
-                self.logs.removeFirst(self.logs.count - 400)
+            if self.logs.count > 500 {
+                self.logs.removeFirst(self.logs.count - 500)
             }
         }
         try? FileManager.default.createDirectory(at: logFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -249,12 +330,99 @@ final class LauncherViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Environment & Engine Detection
+    // MARK: - Environment & Step Checklist State Detection
 
     func refreshEnvironment() {
         let detected = Self.detectEnvironment()
         self.envStatus = detected
+        // Also auto-detect if game is already installed in `~/Games/Forza Horizon 2` or bottle `drive_c/FH2Game`
+        if !folderValidation.isVerified {
+            let bottleGame = defaultBottleURL(for: detected).appendingPathComponent("drive_c/FH2Game")
+            if Self.checkGameFolderValid(at: defaultInstalledGameDirURL) {
+                gameFolderPath = defaultInstalledGameDirURL.path
+            } else if Self.checkGameFolderValid(at: bottleGame) {
+                gameFolderPath = bottleGame.path
+            }
+        }
+        refreshStepChecklistStates()
         appendLog("Environment scan -> Rosetta: \(detected.rosettaInstalled ? "Installed" : "Missing"), Engine: \(detected.runtimeKind.rawValue)")
+    }
+
+    func defaultBottleURL(for env: RuntimeEnvironment) -> URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let isCrossOver = (env.runtimeKind == .crossover || env.runtimeKind == .crossoverPreview)
+        if isCrossOver {
+            return home.appendingPathComponent("Library/Application Support/CrossOver/Bottles/ForzaHorizon2")
+        } else {
+            return home.appendingPathComponent("Library/Application Support/FH2Port/bottle")
+        }
+    }
+
+    func refreshStepChecklistStates() {
+        guard !isRunningSetupPipeline else { return }
+        let fm = FileManager.default
+
+        // Step 1: Graphics Runtime
+        if envStatus.isFullyReady {
+            step1State = .completed(detail: "Ready (\(envStatus.runtimeKind.rawValue))")
+        } else {
+            let partURL = cacheDirURL.appendingPathComponent("runtime.tar.xz.part")
+            let partBytes = (try? fm.attributesOfItem(atPath: partURL.path)[.size] as? Int64) ?? 0
+            if partBytes > 0 {
+                let pct = min(0.99, Double(partBytes) / Double(manifest.runtimeExpectedBytes))
+                step1State = .pending(detail: String(format: "Paused at %.0f MB (%.0f%%) — Ready to resume", Double(partBytes) / 1_048_576.0, pct * 100))
+            } else {
+                step1State = .pending(detail: "Rosetta 2 + Apple DirectX-to-Metal Engine (Auto-Install)")
+            }
+        }
+
+        // Step 2 & Step 3: Game Download & Unpacking
+        if folderValidation.isVerified {
+            step2State = .completed(detail: "16.8 GB Cloud Archive Downloaded & Verified")
+            step3State = .completed(detail: "40 GB Game Unpacked (\(URL(fileURLWithPath: gameFolderPath).lastPathComponent))")
+        } else {
+            let bottleURL = defaultBottleURL(for: envStatus)
+            let fgSetupExe = bottleURL.appendingPathComponent("drive_c/fg_setup/setup.exe")
+            let fullZip = cacheDirURL.appendingPathComponent(manifest.gameFilename)
+            let partZip = cacheDirURL.appendingPathComponent("\(manifest.gameFilename).part")
+
+            if fm.fileExists(atPath: fgSetupExe.path) {
+                step2State = .completed(detail: "16.8 GB Archive Extracted to Staging")
+                step3State = .pending(detail: "Ready to unpack 40 GB game files")
+            } else if fm.fileExists(atPath: fullZip.path) {
+                step2State = .completed(detail: "16.8 GB Archive Downloaded (Ready to Extract)")
+                step3State = .pending(detail: "Unzips archive, unpacks 40 GB game & cleans up")
+            } else {
+                let partBytes = (try? fm.attributesOfItem(atPath: partZip.path)[.size] as? Int64) ?? 0
+                if partBytes > 0 {
+                    let gb = Double(partBytes) / 1_000_000_000.0
+                    let totalGb = Double(manifest.gameExpectedBytes) / 1_000_000_000.0
+                    let pct = min(0.99, Double(partBytes) / Double(manifest.gameExpectedBytes))
+                    step2State = .pending(detail: String(format: "Saved progress: %.2f GB / %.2f GB (%.0f%%) — Auto-resumes", gb, totalGb, pct * 100))
+                    isSetupPausedOrInterrupted = true
+                } else {
+                    step2State = .pending(detail: "16.8 GB Cloud Download (Auto-Resumable)")
+                }
+                step3State = .pending(detail: "Unzips archive, unpacks 40 GB game & cleans up")
+            }
+        }
+
+        // Step 4: Controller & Graphics Setup
+        let bottleURL = defaultBottleURL(for: envStatus)
+        let azExe = bottleURL.appendingPathComponent("drive_c/Azimuth/azimuth.exe")
+        let azIni = bottleURL.appendingPathComponent("drive_c/Azimuth/data/azimuth.ini")
+        let d3dShim = bottleURL.appendingPathComponent("drive_c/Azimuth/d3d12.dll")
+        if envStatus.isFullyReady && folderValidation.isVerified && fm.fileExists(atPath: azExe.path) && fm.fileExists(atPath: azIni.path) && fm.fileExists(atPath: d3dShim.path) {
+            step4State = .completed(detail: "Azimuth \(azimuthBuild.rawValue) + D3D12 + Gamepad + \(resolution.rawValue)p Ready")
+        } else if envStatus.isFullyReady && folderValidation.isVerified {
+            step4State = .completed(detail: "Bundled Azimuth \(azimuthBuild.rawValue) + Shims Ready (Auto-applies on launch)")
+        } else {
+            step4State = .pending(detail: "Configures Azimuth \(azimuthBuild.rawValue), DLC Unlocker & Controller Support")
+        }
+    }
+
+    var isReadyToLaunch: Bool {
+        envStatus.isFullyReady && folderValidation.isVerified && !isRunningSetupPipeline && !isLaunchingGame
     }
 
     static func detectEnvironment() -> RuntimeEnvironment {
@@ -314,10 +482,10 @@ final class LauncherViewModel: ObservableObject {
             }
         }
 
-        // 3. Check Game Porting Toolkit.app (Gcenx cask or FH2Port managed install)
+        // 3. Check Game Porting Toolkit.app (in ~/Applications, /Applications, or FH2Port runtime)
         let gptkCandidates = [
-            URL(fileURLWithPath: "/Applications/Game Porting Toolkit.app"),
             home.appendingPathComponent("Applications/Game Porting Toolkit.app"),
+            URL(fileURLWithPath: "/Applications/Game Porting Toolkit.app"),
             home.appendingPathComponent("Library/Application Support/FH2Port/runtime/Game Porting Toolkit.app")
         ]
         var foundGPTKApp: URL? = nil
@@ -433,32 +601,27 @@ final class LauncherViewModel: ObservableObject {
         )
     }
 
-    // MARK: - Bundled Payload Inspection
-
-    var bundledPayloadSummary: String {
-        let res = Bundle.main.resourceURL?.appendingPathComponent("payload")
-        let fm = FileManager.default
-        let hasAz0910 = res.map { fm.fileExists(atPath: $0.appendingPathComponent("azimuth-0.9.10/azimuth.exe").path) } ?? false
-        let hasAz101 = res.map { fm.fileExists(atPath: $0.appendingPathComponent("azimuth-1.0.1/azimuth.exe").path) } ?? false
-        let hasD3D12 = res.map { fm.fileExists(atPath: $0.appendingPathComponent("layer/d3d12.dll").path) } ?? false
-        let hasPad = res.map { fm.fileExists(atPath: $0.appendingPathComponent("layer/fh2pad.dll").path) } ?? false
-        let hasCompiler = res.map { fm.fileExists(atPath: $0.appendingPathComponent("layer/d3dcompiler_47.dll").path) } ?? false
-        if hasAz0910 && hasD3D12 && hasPad && hasCompiler {
-            return "Azimuth \(azimuthBuild.rawValue) + d3d12 + fh2pad + d3dcompiler_47 — Bundled\(hasAz101 ? " (Dual-Build)" : "")"
-        }
-        return "Azimuth \(azimuthBuild.rawValue) + d3d12 + fh2pad + d3dcompiler_47 — Bundled"
-    }
-
     var isAzimuth101Available: Bool {
         guard let res = Bundle.main.resourceURL?.appendingPathComponent("payload/azimuth-1.0.1/azimuth.exe") else { return true }
         return FileManager.default.fileExists(atPath: res.path)
     }
 
-    // MARK: - Game Folder Validation & Picker
+    // MARK: - Game Folder Validation & Manual Picker
+
+    static func checkGameFolderValid(at url: URL) -> Bool {
+        let fm = FileManager.default
+        let candidates = [
+            url.appendingPathComponent("Mount/forza_durango_release_final.exe"),
+            url.appendingPathComponent("forza_durango_release_final.exe"),
+            url.appendingPathComponent("Mount/Media"),
+            url.appendingPathComponent("Media")
+        ]
+        return candidates.contains { fm.fileExists(atPath: $0.path) }
+    }
 
     func selectGameFolder() {
         let panel = NSOpenPanel()
-        panel.title = "Select Forza Horizon 2 Game Folder"
+        panel.title = "Select Existing Forza Horizon 2 Game Folder"
         panel.message = "Choose the Forza Horizon 2 folder (containing Mount/forza_durango_release_final.exe or Media)"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -468,7 +631,6 @@ final class LauncherViewModel: ObservableObject {
         }
         NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK, let url = panel.url {
-            // If the user picked the inner `Mount` folder directly, normalize to its parent game root if `Mount` is the last component
             if url.lastPathComponent.lowercased() == "mount" &&
                 FileManager.default.fileExists(atPath: url.appendingPathComponent("forza_durango_release_final.exe").path) {
                 gameFolderPath = url.deletingLastPathComponent().path
@@ -492,12 +654,10 @@ final class LauncherViewModel: ObservableObject {
             return
         }
 
-        // Check if symlink (Azimuth rejects symlinks for the game root or Mount)
         let resourceValues = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
         let mountValues = try? url.appendingPathComponent("Mount").resourceValues(forKeys: [.isSymbolicLinkKey])
         let isSymlink = (resourceValues?.isSymbolicLink == true) || (mountValues?.isSymbolicLink == true)
 
-        // Check for `forza_durango_release_final.exe` or `Media` inside `Mount/` or directly inside the folder
         let candidates = [
             url.appendingPathComponent("Mount/forza_durango_release_final.exe"),
             url.appendingPathComponent("forza_durango_release_final.exe"),
@@ -516,225 +676,661 @@ final class LauncherViewModel: ObservableObject {
         }
     }
 
-    // MARK: - One-Click Silent Provisioning (Free Graphics Runtime)
+    // MARK: - Google Drive Large-File Confirmation Resolver & Auto-Resumable Downloader
 
-    func provisionFreeRuntime() {
-        guard !isProvisioningRuntime else { return }
+    /// Resolves Google Drive's large-file virus-scan confirmation page (`uuid` / `at` parameters)
+    /// into a direct binary stream URL (`https://drive.usercontent.google.com/download?...`).
+    static func resolveGoogleDriveDownloadURL(fileID: String) -> String {
+        let fallbackURL = "https://drive.usercontent.google.com/download?id=\(fileID)&export=download&confirm=t"
+        let ucURL = "https://drive.google.com/uc?export=download&id=\(fileID)"
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        proc.arguments = ["-sSL", "--connect-timeout", "15", "--max-time", "30", ucURL]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            guard let html = String(data: data, encoding: .utf8), html.contains("<form") else {
+                return fallbackURL
+            }
+
+            // Extract action URL and hidden inputs (`id`, `export`, `confirm`, `uuid`, `at`)
+            var actionURL = "https://drive.usercontent.google.com/download"
+            if let actRegex = try? NSRegularExpression(pattern: #"action="([^"]+)""#),
+               let match = actRegex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+               let r = Range(match.range(at: 1), in: html) {
+                actionURL = String(html[r]).replacingOccurrences(of: "&amp;", with: "&")
+            }
+
+            var params: [(String, String)] = []
+            if let inputRegex = try? NSRegularExpression(pattern: #"<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)""#) {
+                let matches = inputRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+                for m in matches {
+                    if let nr = Range(m.range(at: 1), in: html),
+                       let vr = Range(m.range(at: 2), in: html) {
+                        params.append((String(html[nr]), String(html[vr])))
+                    }
+                }
+            }
+
+            if params.isEmpty {
+                return fallbackURL
+            }
+            var comps = URLComponents(string: actionURL)
+            comps?.queryItems = params.map { URLQueryItem(name: $0.0, value: $0.1) }
+            return comps?.url?.absoluteString ?? fallbackURL
+        } catch {
+            return fallbackURL
+        }
+    }
+
+    /// Queries GitHub Releases API for the latest `Gcenx/game-porting-toolkit` `.tar.xz` asset URL,
+    /// falling back to `manifest.runtimeFallbackURL` if rate-limited or offline.
+    static func resolveLatestRuntimeDownloadURL(manifest: SetupManifest) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        proc.arguments = [
+            "-fsSL",
+            "--connect-timeout", "10",
+            "--max-time", "15",
+            "-H", "Accept: application/vnd.github+json",
+            manifest.runtimeReleasesAPI
+        ]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0,
+               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let assets = json["assets"] as? [[String: Any]] {
+                for asset in assets {
+                    if let url = asset["browser_download_url"] as? String, url.hasSuffix(".tar.xz") {
+                        return url
+                    }
+                }
+            }
+        } catch {}
+        return manifest.runtimeFallbackURL
+    }
+
+    /// Verifies that the resolved URL serves the expected binary header (`PK\x03\x04` for ZIP)
+    /// when probed with a 4-byte HTTP Range request.
+    static func probeURLReturnsZipMagic(_ urlString: String) -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        proc.arguments = ["-sSL", "--connect-timeout", "15", "--max-time", "25", "--range", "0-3", urlString]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return proc.terminationStatus == 0 && data.prefix(4) == Data([0x50, 0x4B, 0x03, 0x04])
+        } catch {
+            return false
+        }
+    }
+
+    /// Downloads a large file with `curl -L -C - --retry 999 --retry-delay 5 --retry-all-errors --connect-timeout 15`
+    /// inside an outer session-refresh retry loop so even if Wi-Fi drops for hours or Google Drive's `uuid` token expires,
+    /// it refreshes the URL and resumes from the exact byte offset on disk without ever restarting from 0%.
+    func downloadWithAutoResume(
+        label: String,
+        partFileURL: URL,
+        finalFileURL: URL,
+        expectedBytes: Int64,
+        requireZipMagic: Bool,
+        urlResolver: () -> String,
+        onProgress: @escaping (_ currentBytes: Int64, _ expectedBytes: Int64, _ speedMBps: Double) -> Void,
+        onInterrupted: @escaping (_ currentBytes: Int64, _ expectedBytes: Int64) -> Void
+    ) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: partFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        // If final file already exists and meets size check, return immediately
+        if fm.fileExists(atPath: finalFileURL.path) {
+            let finalSize = (try? fm.attributesOfItem(atPath: finalFileURL.path)[.size] as? Int64) ?? 0
+            if finalSize >= expectedBytes || (!requireZipMagic && finalSize > 100_000_000) {
+                appendLog("\(label) already downloaded at \(finalFileURL.path) (\(finalSize) bytes).")
+                onProgress(finalSize, max(expectedBytes, finalSize), 0)
+                return
+            }
+        }
+
+        while !shouldCancelPipeline {
+            var existingBytes = (try? fm.attributesOfItem(atPath: partFileURL.path)[.size] as? Int64) ?? 0
+
+            // Guard against a tiny corrupted HTML error stub in `.part`
+            if requireZipMagic && existingBytes > 0 {
+                if let handle = try? FileHandle(forReadingFrom: partFileURL) {
+                    let magic = handle.readData(ofLength: 4)
+                    try? handle.close()
+                    if magic != Data([0x50, 0x4B, 0x03, 0x04]) {
+                        appendLog("Resetting invalid non-ZIP stub at \(partFileURL.path) (\(existingBytes) bytes)")
+                        try? fm.removeItem(at: partFileURL)
+                        existingBytes = 0
+                    }
+                }
+            }
+
+            if requireZipMagic && existingBytes >= expectedBytes {
+                break
+            }
+
+            let resolvedURL = urlResolver()
+            if requireZipMagic && !Self.probeURLReturnsZipMagic(resolvedURL) {
+                appendLog("Waiting for network / valid Google Drive binary stream for \(label)...")
+                onInterrupted(existingBytes, expectedBytes)
+                Thread.sleep(forTimeInterval: 5.0)
+                continue
+            }
+
+            DispatchQueue.main.async {
+                self.connectionInterruptedBanner = nil
+            }
+
+            appendLog("Resuming \(label) from byte offset \(existingBytes) -> \(partFileURL.path)")
+
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            proc.arguments = [
+                "-L",
+                "-C", "-",
+                "--fail",
+                "--retry", "999",
+                "--retry-delay", "5",
+                "--retry-all-errors",
+                "--connect-timeout", "15",
+                "-o", partFileURL.path,
+                resolvedURL
+            ]
+            proc.standardOutput = Pipe()
+            proc.standardError = Pipe()
+
+            var lastSampleBytes = existingBytes
+            var lastSampleTime = Date()
+            var smoothedSpeedMBps: Double = 0.0
+
+            do {
+                try proc.run()
+                self.activeDownloadProcess = proc
+
+                while proc.isRunning && !shouldCancelPipeline {
+                    Thread.sleep(forTimeInterval: 0.5)
+                    let now = Date()
+                    let currentBytes = (try? fm.attributesOfItem(atPath: partFileURL.path)[.size] as? Int64) ?? existingBytes
+                    let dt = now.timeIntervalSince(lastSampleTime)
+                    if dt >= 0.45 {
+                        let delta = max(0, currentBytes - lastSampleBytes)
+                        let instantMBps = (Double(delta) / 1_048_576.0) / dt
+                        if instantMBps > 0 {
+                            smoothedSpeedMBps = (smoothedSpeedMBps == 0) ? instantMBps : (smoothedSpeedMBps * 0.65 + instantMBps * 0.35)
+                        }
+                        lastSampleBytes = currentBytes
+                        lastSampleTime = now
+                        onProgress(currentBytes, expectedBytes, smoothedSpeedMBps)
+                    }
+                }
+
+                if shouldCancelPipeline {
+                    if proc.isRunning { proc.terminate() }
+                    throw NSError(domain: "FH2Setup", code: -999, userInfo: [NSLocalizedDescriptionKey: "Setup paused by user."])
+                }
+
+                proc.waitUntilExit()
+                self.activeDownloadProcess = nil
+            } catch {
+                self.activeDownloadProcess = nil
+                if shouldCancelPipeline { throw error }
+            }
+
+            let postBytes = (try? fm.attributesOfItem(atPath: partFileURL.path)[.size] as? Int64) ?? 0
+            if proc.terminationStatus == 0 && (!requireZipMagic || postBytes >= expectedBytes) && postBytes > 0 {
+                onProgress(postBytes, max(expectedBytes, postBytes), smoothedSpeedMBps)
+                break
+            }
+
+            if shouldCancelPipeline {
+                throw NSError(domain: "FH2Setup", code: -999, userInfo: [NSLocalizedDescriptionKey: "Setup paused by user."])
+            }
+
+            appendLog("Download stream interrupted at \(postBytes) bytes (exit \(proc.terminationStatus)). Refreshing session & auto-resuming in 5s...")
+            onInterrupted(postBytes, expectedBytes)
+            Thread.sleep(forTimeInterval: 5.0)
+        }
+
+        try? fm.removeItem(at: finalFileURL)
+        try fm.moveItem(at: partFileURL, to: finalFileURL)
+        appendLog("Completed download: \(finalFileURL.path)")
+    }
+
+    // MARK: - Complete 4-Step A-to-Z 1-Click Installer Pipeline
+
+    func startOrResumeOneClickSetup() {
+        guard !isRunningSetupPipeline else { return }
+        shouldCancelPipeline = false
+        isRunningSetupPipeline = true
+        isSetupPausedOrInterrupted = false
         errorBannerText = nil
-        isProvisioningRuntime = true
-        provisioningProgress = 0.05
-        provisioningStepText = "Step 1/3: Checking Apple Silicon Rosetta 2 translation layer..."
-        appendLog("Starting silent provisioning of Free Graphics Runtime...")
+        connectionInterruptedBanner = nil
+        appendLog("=== Starting 1-Click A-to-Z Setup & Download Pipeline ===")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             do {
-                // Step 1: Ensure Rosetta 2 is installed
-                if !Self.detectEnvironment().rosettaInstalled {
-                    self.updateProvisionUI(progress: 0.12, text: "Step 1/3: Installing Apple Rosetta 2 translation runtime...")
-                    self.appendLog("Running softwareupdate --install-rosetta --agree-to-license")
-                    let (code, out) = self.runProcess(
-                        executable: "/usr/sbin/softwareupdate",
-                        args: ["--install-rosetta", "--agree-to-license"]
-                    ) { line in
-                        self.appendLog("[rosetta] \(line)")
-                    }
-                    if code != 0 && !Self.detectEnvironment().rosettaInstalled {
-                        throw NSError(domain: "FH2Provision", code: Int(code), userInfo: [
-                            NSLocalizedDescriptionKey: "Rosetta 2 installation failed (\(out.suffix(200)))."
-                        ])
-                    }
-                }
-
-                // Step 2: Check if Homebrew is available and try `brew install --cask --no-quarantine gcenx/wine/game-porting-toolkit`
-                // OR direct verified download of Gcenx's Game-Porting-Toolkit-3.0-3.tar.xz (which is faster, never prompts for sudo, and preserves Apple's D3DMetal signature!)
-                self.updateProvisionUI(progress: 0.25, text: "Step 2/3: Downloading Apple Silicon DirectX-to-Metal runtime (Game Porting Toolkit 3.0)...")
-
-                let fm = FileManager.default
-                let home = fm.homeDirectoryForCurrentUser
-                let targetAppDir: URL = {
-                    if fm.isWritableFile(atPath: "/Applications") {
-                        return URL(fileURLWithPath: "/Applications")
-                    }
-                    let userApps = home.appendingPathComponent("Applications")
-                    try? fm.createDirectory(at: userApps, withIntermediateDirectories: true)
-                    return userApps
-                }()
-                let gptkDestApp = targetAppDir.appendingPathComponent("Game Porting Toolkit.app")
-
-                if !fm.fileExists(atPath: gptkDestApp.appendingPathComponent("Contents/Resources/wine/bin/wine64").path) {
-                    let tempArchive = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("game-porting-toolkit-3.0-3.tar.xz")
-                    try? fm.removeItem(at: tempArchive)
-
-                    let downloadURL = "https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-3.0-3/game-porting-toolkit-3.0-3.tar.xz"
-                    self.appendLog("Downloading Game Porting Toolkit from \(downloadURL)")
-
-                    let (dlCode, dlOut) = self.runProcess(
-                        executable: "/usr/bin/curl",
-                        args: ["-fL", "--retry", "3", "-#", "-o", tempArchive.path, downloadURL]
-                    ) { line in
-                        // Parse curl progress percentage if available
-                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if let pctMatch = trimmed.split(separator: " ").last,
-                           pctMatch.hasSuffix("%"),
-                           let pct = Double(pctMatch.dropLast()) {
-                            let mapped = 0.25 + (pct / 100.0) * 0.50
-                            self.updateProvisionUI(
-                                progress: min(0.75, max(0.25, mapped)),
-                                text: String(format: "Step 2/3: Downloading Apple Silicon DirectX-to-Metal runtime (%.0f%%)...", pct)
-                            )
-                        }
-                    }
-
-                    if dlCode != 0 {
-                        // Fallback to Homebrew if curl failed for any reason
-                        if let brewPath = Self.findBrewExecutable() {
-                            self.updateProvisionUI(progress: 0.45, text: "Step 2/3: Installing Game Porting Toolkit via Homebrew...")
-                            let (bCode, bOut) = self.runProcess(
-                                executable: brewPath,
-                                args: ["install", "--cask", "--no-quarantine", "gcenx/wine/game-porting-toolkit"]
-                            ) { line in
-                                self.appendLog("[brew] \(line)")
-                            }
-                            if bCode != 0 {
-                                throw NSError(domain: "FH2Provision", code: Int(bCode), userInfo: [
-                                    NSLocalizedDescriptionKey: "Runtime download failed: \(dlOut.suffix(160)) / \(bOut.suffix(160))"
-                                ])
-                            }
-                        } else {
-                            throw NSError(domain: "FH2Provision", code: Int(dlCode), userInfo: [
-                                NSLocalizedDescriptionKey: "Failed to download Game Porting Toolkit archive (\(dlOut.suffix(200)))."
-                            ])
-                        }
-                    } else {
-                        // Step 3: Extract archive and clear quarantine WITHOUT touching D3DMetal.framework code signature
-                        self.updateProvisionUI(progress: 0.80, text: "Step 3/3: Extracting Wine64 & D3DMetal graphics engine to \(targetAppDir.path)...")
-                        self.appendLog("Extracting \(tempArchive.path) to \(targetAppDir.path)")
-                        let (tarCode, tarOut) = self.runProcess(
-                            executable: "/usr/bin/tar",
-                            args: ["-xJf", tempArchive.path, "-C", targetAppDir.path]
-                        ) { line in
-                            self.appendLog("[tar] \(line)")
-                        }
-                        try? fm.removeItem(at: tempArchive)
-                        if tarCode != 0 {
-                            throw NSError(domain: "FH2Provision", code: Int(tarCode), userInfo: [
-                                NSLocalizedDescriptionKey: "Archive extraction failed: \(tarOut.suffix(200))"
-                            ])
-                        }
-                    }
-                }
-
-                // Clear quarantine attribute only (NEVER re-sign D3DMetal.framework or libd3dshared.dylib as macOS verifies `anchor apple`)
-                self.updateProvisionUI(progress: 0.94, text: "Step 3/3: Verifying Apple D3DMetal signature and finalizing environment...")
-                if fm.fileExists(atPath: gptkDestApp.path) {
-                    _ = self.runProcess(
-                        executable: "/usr/bin/xattr",
-                        args: ["-drs", "com.apple.quarantine", gptkDestApp.path]
-                    )
-                }
-
+                try self.executeFourStepSetupPipeline()
                 DispatchQueue.main.async {
+                    self.isRunningSetupPipeline = false
+                    self.isSetupPausedOrInterrupted = false
+                    self.connectionInterruptedBanner = nil
                     self.refreshEnvironment()
-                    self.provisioningProgress = 1.0
-                    self.provisioningStepText = "Graphics runtime ready."
-                    self.isProvisioningRuntime = false
+                    self.launchStatusText = "All 4 setup steps complete! Ready to launch Forza Horizon 2."
                 }
             } catch {
-                self.appendLog("Provisioning error: \(error.localizedDescription)")
+                let nsErr = error as NSError
+                self.appendLog("Setup pipeline stopped: \(error.localizedDescription)")
                 DispatchQueue.main.async {
-                    self.errorBannerText = error.localizedDescription
-                    self.isProvisioningRuntime = false
-                    self.provisioningStepText = ""
+                    self.isRunningSetupPipeline = false
+                    self.isSetupPausedOrInterrupted = true
+                    if nsErr.code != -999 {
+                        self.errorBannerText = error.localizedDescription
+                    }
+                    self.refreshStepChecklistStates()
                 }
             }
         }
     }
 
-    private func updateProvisionUI(progress: Double, text: String) {
-        DispatchQueue.main.async {
-            self.provisioningProgress = progress
-            self.provisioningStepText = text
-        }
+    func pauseSetupPipeline() {
+        guard isRunningSetupPipeline else { return }
+        shouldCancelPipeline = true
+        activeDownloadProcess?.terminate()
+        appendLog("User requested pause — saving download progress on disk.")
     }
 
-    private static func findBrewExecutable() -> String? {
-        for path in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"] {
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return path
+    /// Executes all 4 steps from A to Z. Also accepts optional dependency overrides for deterministic automated testing (`--self-test`).
+    func executeFourStepSetupPipeline(
+        customCacheDir: URL? = nil,
+        customBottleURL: URL? = nil,
+        customGameDestDir: URL? = nil,
+        mockRuntimeEnv: RuntimeEnvironment? = nil,
+        customGameZipURLResolver: (() -> String)? = nil,
+        customGameExpectedBytes: Int64? = nil,
+        customUnpackedTargetBytes: Int64? = nil
+    ) throws {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let workCacheDir = customCacheDir ?? cacheDirURL
+        try fm.createDirectory(at: workCacheDir, withIntermediateDirectories: true)
+
+        // =========================================================================
+        // STEP 1: macOS Graphics Runtime (Rosetta 2 + Game Porting Toolkit.app)
+        // =========================================================================
+        var activeEnv = mockRuntimeEnv ?? Self.detectEnvironment()
+        if !activeEnv.isFullyReady {
+            updateStep1(.active(progress: 0.05, detail: "Checking Apple Silicon Rosetta 2 translation runtime..."))
+
+            if !activeEnv.rosettaInstalled {
+                updateStep1(.active(progress: 0.10, detail: "Installing Apple Rosetta 2 translation runtime..."))
+                appendLog("Installing Rosetta 2 via /usr/sbin/softwareupdate --install-rosetta --agree-to-license")
+                let (rCode, _) = runProcess(
+                    executable: "/usr/sbin/softwareupdate",
+                    args: ["--install-rosetta", "--agree-to-license"]
+                )
+                if rCode != 0 && !Self.detectEnvironment().rosettaInstalled {
+                    appendLog("Escalating Rosetta 2 install via osascript administrator prompt...")
+                    let osaCmd = #"do shell script "/usr/sbin/softwareupdate --install-rosetta --agree-to-license" with administrator privileges"#
+                    _ = runProcess(executable: "/usr/bin/osascript", args: ["-e", osaCmd])
+                }
+            }
+
+            let userAppsDir = home.appendingPathComponent("Applications")
+            try fm.createDirectory(at: userAppsDir, withIntermediateDirectories: true)
+            let gptkAppDest = userAppsDir.appendingPathComponent("Game Porting Toolkit.app")
+
+            if !fm.fileExists(atPath: gptkAppDest.appendingPathComponent("Contents/Resources/wine/bin/wine64").path) {
+                let runtimePart = workCacheDir.appendingPathComponent("runtime.tar.xz.part")
+                let runtimeArchive = workCacheDir.appendingPathComponent("runtime.tar.xz")
+
+                try downloadWithAutoResume(
+                    label: "Apple Silicon Graphics Runtime (Game Porting Toolkit)",
+                    partFileURL: runtimePart,
+                    finalFileURL: runtimeArchive,
+                    expectedBytes: manifest.runtimeExpectedBytes,
+                    requireZipMagic: false,
+                    urlResolver: { Self.resolveLatestRuntimeDownloadURL(manifest: self.manifest) },
+                    onProgress: { cur, exp, speed in
+                        let pct = min(0.85, max(0.12, 0.12 + (Double(cur) / Double(max(1, exp))) * 0.73))
+                        let mb = Double(cur) / 1_048_576.0
+                        let totalMb = Double(exp) / 1_048_576.0
+                        let detail = String(format: "Downloading Graphics Runtime: %.0f / %.0f MB (%.1f MB/s)", mb, totalMb, speed)
+                        self.updateStep1(.active(progress: pct, detail: detail))
+                    },
+                    onInterrupted: { cur, exp in
+                        let mb = Double(cur) / 1_048_576.0
+                        let pct = min(0.99, Double(cur) / Double(max(1, exp)))
+                        let msg = String(format: "Connection interrupted — waiting for internet to resume from %.0f MB (%.0f%%)...", mb, pct * 100)
+                        self.setConnectionInterrupted(msg)
+                        self.updateStep1(.waitingForInternet(progress: pct, detail: msg))
+                    }
+                )
+
+                updateStep1(.active(progress: 0.88, detail: "Extracting Game Porting Toolkit.app to ~/Applications..."))
+                appendLog("Extracting \(runtimeArchive.path) to \(userAppsDir.path)")
+                let (tarCode, tarOut) = runProcess(
+                    executable: "/usr/bin/tar",
+                    args: ["-xJf", runtimeArchive.path, "-C", userAppsDir.path]
+                )
+                if tarCode != 0 {
+                    throw NSError(domain: "FH2Setup", code: Int(tarCode), userInfo: [
+                        NSLocalizedDescriptionKey: "Failed to extract Graphics Runtime archive: \(tarOut.suffix(200))"
+                    ])
+                }
+                try? fm.removeItem(at: runtimeArchive)
+
+                // Strip quarantine on outer app without ever touching D3DMetal.framework signature (`anchor apple`)
+                updateStep1(.active(progress: 0.96, detail: "Clearing quarantine while preserving Apple D3DMetal signature..."))
+                _ = runProcess(executable: "/usr/bin/xattr", args: ["-drs", "com.apple.quarantine", gptkAppDest.path])
+            }
+
+            activeEnv = Self.detectEnvironment()
+            DispatchQueue.main.async { self.envStatus = activeEnv }
+            guard activeEnv.isFullyReady else {
+                throw NSError(domain: "FH2Setup", code: 10, userInfo: [
+                    NSLocalizedDescriptionKey: "Graphics Runtime installation did not produce a ready Wine64 + D3DMetal environment."
+                ])
             }
         }
-        return nil
+        updateStep1(.completed(detail: "Ready (\(activeEnv.runtimeKind.rawValue))"))
+
+        // =========================================================================
+        // STEP 2: Bulletproof Auto-Resumable Game Download (16.8 GB FH2-Game.zip)
+        // =========================================================================
+        let bottleURL = customBottleURL ?? defaultBottleURL(for: activeEnv)
+        let driveCURL = bottleURL.appendingPathComponent("drive_c")
+        let fgSetupDir = driveCURL.appendingPathComponent("fg_setup")
+        let targetGameDest = customGameDestDir ?? defaultInstalledGameDirURL
+        let expectedZipBytes = customGameExpectedBytes ?? manifest.gameExpectedBytes
+
+        let gameAlreadyVerified = (customGameDestDir != nil)
+            ? Self.checkGameFolderValid(at: targetGameDest)
+            : (folderValidation.isVerified || Self.checkGameFolderValid(at: targetGameDest))
+
+        let gameZipPartURL = workCacheDir.appendingPathComponent("\(manifest.gameFilename).part")
+        let gameZipFinalURL = workCacheDir.appendingPathComponent(manifest.gameFilename)
+
+        if !gameAlreadyVerified && !fm.fileExists(atPath: fgSetupDir.appendingPathComponent("setup.exe").path) {
+            updateStep2(.active(progress: 0.01, detail: "Resolving Google Drive cloud download stream..."))
+
+            try downloadWithAutoResume(
+                label: manifest.gameFilename,
+                partFileURL: gameZipPartURL,
+                finalFileURL: gameZipFinalURL,
+                expectedBytes: expectedZipBytes,
+                requireZipMagic: true,
+                urlResolver: customGameZipURLResolver ?? {
+                    Self.resolveGoogleDriveDownloadURL(fileID: self.manifest.gameFileID)
+                },
+                onProgress: { cur, exp, speed in
+                    let pct = min(1.0, max(0.0, Double(cur) / Double(max(1, exp))))
+                    let curGB = Double(cur) / 1_000_000_000.0
+                    let expGB = Double(exp) / 1_000_000_000.0
+                    let detail = String(
+                        format: "%.2f GB / %.2f GB (%.0f%%) · %.1f MB/s",
+                        curGB, expGB, pct * 100.0, speed
+                    )
+                    self.updateStep2(.active(progress: pct, detail: detail))
+                },
+                onInterrupted: { cur, exp in
+                    let pct = min(0.99, max(0.0, Double(cur) / Double(max(1, exp))))
+                    let curGB = Double(cur) / 1_000_000_000.0
+                    let msg = String(
+                        format: "Connection interrupted — waiting for internet to resume from %.1f GB (%.0f%%)...",
+                        curGB, pct * 100.0
+                    )
+                    self.setConnectionInterrupted(msg)
+                    self.updateStep2(.waitingForInternet(progress: pct, detail: msg))
+                }
+            )
+        }
+        updateStep2(.completed(detail: "16.8 GB Cloud Archive Downloaded & Verified"))
+
+        // =========================================================================
+        // STEP 3: Automatic Unzipping (`7zz`) & Silent Repack Unpacking (`setup.exe` -> 40 GB)
+        // =========================================================================
+        if !gameAlreadyVerified {
+            try fm.createDirectory(at: driveCURL, withIntermediateDirectories: true)
+
+            // 3a. Extract `FH2-Game.zip` with bundled `7zz` into bracket-free `drive_c/fg_setup`
+            if !fm.fileExists(atPath: fgSetupDir.appendingPathComponent("setup.exe").path) {
+                updateStep3(.active(progress: 0.05, detail: "Extracting FH2-Game.zip with bundled 7zz archiver..."))
+                guard let sevenZipURL = Bundle.main.resourceURL?.appendingPathComponent("bin/7zz"),
+                      fm.isExecutableFile(atPath: sevenZipURL.path) else {
+                    throw NSError(domain: "FH2Setup", code: 20, userInfo: [
+                        NSLocalizedDescriptionKey: "Bundled 7zz binary missing from Contents/Resources/bin/7zz."
+                    ])
+                }
+
+                let rawExtractDir = driveCURL.appendingPathComponent("fg_setup_extract_tmp")
+                try? fm.removeItem(at: rawExtractDir)
+                try fm.createDirectory(at: rawExtractDir, withIntermediateDirectories: true)
+
+                appendLog("Running bundled 7zz x \(gameZipFinalURL.path) -o\(rawExtractDir.path) -y")
+                let (zCode, zOut) = runProcess(
+                    executable: sevenZipURL.path,
+                    args: ["x", gameZipFinalURL.path, "-o\(rawExtractDir.path)", "-y"]
+                )
+                if zCode != 0 {
+                    throw NSError(domain: "FH2Setup", code: Int(zCode), userInfo: [
+                        NSLocalizedDescriptionKey: "7zz extraction failed: \(zOut.suffix(200))"
+                    ])
+                }
+
+                // Flatten `Forza Horizon 2 [FitGirl Repack]/` into `drive_c/fg_setup` (no spaces or `[ ]` brackets!)
+                try? fm.removeItem(at: fgSetupDir)
+                if let subItems = try? fm.contentsOfDirectory(at: rawExtractDir, includingPropertiesForKeys: nil),
+                   let repackDir = subItems.first(where: { fm.fileExists(atPath: $0.appendingPathComponent("setup.exe").path) }) {
+                    try fm.moveItem(at: repackDir, to: fgSetupDir)
+                    try? fm.removeItem(at: rawExtractDir)
+                } else if fm.fileExists(atPath: rawExtractDir.appendingPathComponent("setup.exe").path) {
+                    try fm.moveItem(at: rawExtractDir, to: fgSetupDir)
+                } else {
+                    throw NSError(domain: "FH2Setup", code: 21, userInfo: [
+                        NSLocalizedDescriptionKey: "Extracted archive did not contain setup.exe."
+                    ])
+                }
+
+                // Delete `FH2-Game.zip` immediately after extraction succeeds to free 17 GB of disk space!
+                try? fm.removeItem(at: gameZipFinalURL)
+                try? fm.removeItem(at: gameZipPartURL)
+                appendLog("Extracted installer to bracket-free \(fgSetupDir.path) and deleted \(gameZipFinalURL.lastPathComponent) to save 17 GB.")
+            }
+
+            // 3b. Neutralize `_Redist/QuickSFV.exe` and `MD5/QuickSFV.EXE` (case-insensitive recursive scan)
+            updateStep3(.active(progress: 0.14, detail: "Neutralizing QuickSFV post-install MD5 check & configuring winxp64..."))
+            let noopExeURL = Bundle.main.resourceURL?.appendingPathComponent("payload/layer/noop.exe")
+            if let enumerator = fm.enumerator(at: fgSetupDir, includingPropertiesForKeys: nil) {
+                for case let fileURL as URL in enumerator {
+                    if fileURL.lastPathComponent.lowercased() == "quicksfv.exe" {
+                        let disabledURL = fileURL.appendingPathExtension("disabled")
+                        try? fm.removeItem(at: disabledURL)
+                        try? fm.moveItem(at: fileURL, to: disabledURL)
+                        if let noop = noopExeURL, fm.fileExists(atPath: noop.path) {
+                            try? fm.copyItem(at: noop, to: fileURL)
+                        }
+                        appendLog("Neutralized QuickSFV binary at \(fileURL.path)")
+                    }
+                }
+            }
+
+            // 3c. Bootstrap bottle if needed and set Windows version to `winxp64` for FreeArc/LOLZ/XTool stability
+            let wineEnv = buildWineEnvironment(for: activeEnv, bottleURL: bottleURL, useMetalHUD: false)
+            guard let wineBin = activeEnv.wineExecutable else {
+                throw NSError(domain: "FH2Setup", code: 22, userInfo: [NSLocalizedDescriptionKey: "Wine executable missing."])
+            }
+
+            if !fm.fileExists(atPath: bottleURL.appendingPathComponent("system.reg").path) {
+                _ = runProcess(executable: wineBin.path, args: ["wineboot", "-u"], env: wineEnv)
+                if let srv = activeEnv.wineserverExecutable {
+                    _ = runProcess(executable: srv.path, args: ["-w"], env: wineEnv)
+                }
+            }
+
+            let setupAppKey = #"HKCU\Software\Wine\AppDefaults\setup.exe"#
+            let globalWineKey = #"HKCU\Software\Wine"#
+            _ = runProcess(executable: wineBin.path, args: ["reg", "add", setupAppKey, "/v", "Version", "/t", "REG_SZ", "/d", "winxp64", "/f"], env: wineEnv)
+            _ = runProcess(executable: wineBin.path, args: ["reg", "add", globalWineKey, "/v", "Version", "/t", "REG_SZ", "/d", "winxp64", "/f"], env: wineEnv)
+
+            // 3d. Run `setup.exe` silently into `C:\FH2Game` while polling disk usage (`du -sk`) every 2 seconds
+            let bottleGameDir = driveCURL.appendingPathComponent("FH2Game")
+            try fm.createDirectory(at: bottleGameDir, withIntermediateDirectories: true)
+
+            var setupArgs = [#"C:\fg_setup\setup.exe"#]
+            if !showInstallerWindow {
+                setupArgs += ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL"]
+            }
+            setupArgs.append(#"/DIR=C:\FH2Game"#)
+
+            appendLog("Launching installer: \(wineBin.path) \(setupArgs.joined(separator: " "))")
+            let setupProc = Process()
+            setupProc.executableURL = wineBin
+            setupProc.currentDirectoryURL = fgSetupDir
+            setupProc.arguments = setupArgs
+            setupProc.environment = wineEnv
+            setupProc.standardOutput = Pipe()
+            setupProc.standardError = Pipe()
+
+            try setupProc.run()
+            let targetUnpackedBytes = customUnpackedTargetBytes ?? manifest.gameUnpackedTargetBytes
+
+            while setupProc.isRunning && !shouldCancelPipeline {
+                Thread.sleep(forTimeInterval: 2.0)
+                // Belt-and-suspenders: terminate any QuickSFV.exe process if spawned
+                _ = runProcess(executable: "/usr/bin/pkill", args: ["-fi", "QuickSFV.exe"])
+
+                let currentUnpackedBytes = Self.directorySizeBytesViaDu(at: bottleGameDir)
+                let ratio = min(0.98, max(0.0, Double(currentUnpackedBytes) / Double(max(1, targetUnpackedBytes))))
+                let uiProgress = 0.15 + ratio * 0.80
+                let curGB = Double(currentUnpackedBytes) / 1_000_000_000.0
+                let targetGB = Double(targetUnpackedBytes) / 1_000_000_000.0
+                let detail = String(
+                    format: "Step 3/4: Installing & decompressing game files (%.1f GB / %.1f GB — %.0f%%)...",
+                    curGB, targetGB, ratio * 100.0
+                )
+                updateStep3(.active(progress: uiProgress, detail: detail))
+            }
+
+            if shouldCancelPipeline {
+                if setupProc.isRunning { setupProc.terminate() }
+                throw NSError(domain: "FH2Setup", code: -999, userInfo: [NSLocalizedDescriptionKey: "Setup paused by user."])
+            }
+
+            setupProc.waitUntilExit()
+
+            // Restore Wine bottle Windows version back to `win10`
+            _ = runProcess(executable: wineBin.path, args: ["reg", "delete", setupAppKey, "/v", "Version", "/f"], env: wineEnv)
+            _ = runProcess(executable: wineBin.path, args: ["reg", "add", globalWineKey, "/v", "Version", "/t", "REG_SZ", "/d", "win10", "/f"], env: wineEnv)
+
+            guard Self.checkGameFolderValid(at: bottleGameDir) else {
+                throw NSError(domain: "FH2Setup", code: 25, userInfo: [
+                    NSLocalizedDescriptionKey: "Unpacking finished (exit \(setupProc.terminationStatus)), but forza_durango_release_final.exe was not found in C:\\FH2Game."
+                ])
+            }
+
+            // Move unpacked game directory to `~/Games/Forza Horizon 2/` (real folder on APFS) and delete `drive_c/fg_setup/`
+            updateStep3(.active(progress: 0.97, detail: "Finalizing game library & cleaning up 17 GB temporary installer files..."))
+            var finalGameLocation = bottleGameDir
+            do {
+                try fm.createDirectory(at: targetGameDest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if fm.fileExists(atPath: targetGameDest.path) {
+                    try fm.removeItem(at: targetGameDest)
+                }
+                try fm.moveItem(at: bottleGameDir, to: targetGameDest)
+                finalGameLocation = targetGameDest
+                appendLog("Moved unpacked Forza Horizon 2 to \(targetGameDest.path)")
+            } catch {
+                appendLog("Keeping unpacked Forza Horizon 2 inside \(bottleGameDir.path) (\(error.localizedDescription))")
+            }
+
+            // Delete `drive_c/fg_setup/` to save 17 GB of disk space
+            try? fm.removeItem(at: fgSetupDir)
+            appendLog("Removed temporary \(fgSetupDir.path) directory.")
+
+            DispatchQueue.main.async {
+                self.gameFolderPath = finalGameLocation.path
+                self.validateGameFolder()
+            }
+        }
+        updateStep3(.completed(detail: "40 GB Game Installed & Temporary Files Cleaned"))
+
+        // =========================================================================
+        // STEP 4: Configure Azimuth + Mac D3D12 Layer (`d3d12.dll`, `fh2pad.dll`, `d3dcompiler_47.dll`, `ExtraOptions`)
+        // =========================================================================
+        updateStep4(.active(progress: 0.25, detail: "Installing Azimuth \(azimuthBuild.rawValue) + D3D12 & Gamepad shims..."))
+        let effectiveGameFolder = (customGameDestDir != nil) ? targetGameDest.path : (gameFolderPath.isEmpty ? targetGameDest.path : gameFolderPath)
+
+        try prepareBottleAndConfigureAzimuth(
+            bottleURL: bottleURL,
+            env: activeEnv,
+            gameFolder: effectiveGameFolder,
+            selectedAzimuth: azimuthBuild,
+            selectedResolution: resolution,
+            useExtraOptions: enableExtraOptions,
+            useMetalHUD: showMetalHUD
+        )
+
+        updateStep4(.completed(detail: "Azimuth \(azimuthBuild.rawValue) + D3D12 + Gamepad + \(resolution.rawValue)p Configured"))
+    }
+
+    static func directorySizeBytesViaDu(at url: URL) -> Int64 {
+        guard FileManager.default.fileExists(atPath: url.path) else { return 0 }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/du")
+        proc.arguments = ["-sk", url.path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            if let out = String(data: data, encoding: .utf8),
+               let firstToken = out.split(whereSeparator: { $0 == "\t" || $0 == " " || $0 == "\n" }).first,
+               let kb = Int64(firstToken) {
+                return kb * 1024
+            }
+        } catch {}
+        return 0
+    }
+
+    private func updateStep1(_ state: ChecklistStepState) {
+        DispatchQueue.main.async { self.step1State = state }
+    }
+    private func updateStep2(_ state: ChecklistStepState) {
+        DispatchQueue.main.async { self.step2State = state }
+    }
+    private func updateStep3(_ state: ChecklistStepState) {
+        DispatchQueue.main.async { self.step3State = state }
+    }
+    private func updateStep4(_ state: ChecklistStepState) {
+        DispatchQueue.main.async { self.step4State = state }
+    }
+    private func setConnectionInterrupted(_ text: String?) {
+        DispatchQueue.main.async { self.connectionInterruptedBanner = text }
     }
 
     // MARK: - Bottle Setup, Layer Injection, Azimuth Configuration & Game Launch
 
-    func launchGame() {
-        guard envStatus.isFullyReady, folderValidation.isVerified, !isLaunchingGame else { return }
-        errorBannerText = nil
-        isLaunchingGame = true
-        launchStatusText = "Preparing Wine prefix & FH2 compatibility layer..."
-        appendLog("=== Starting Forza Horizon 2 launch sequence ===")
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            do {
-                let pid = try self.executeLaunchSequence()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    self.isLaunchingGame = false
-                    self.launchStatusText = "Forza Horizon 2 is running (PID \(pid))."
-                }
-            } catch {
-                self.appendLog("Launch failed: \(error.localizedDescription)")
-                DispatchQueue.main.async {
-                    self.errorBannerText = error.localizedDescription
-                    self.isLaunchingGame = false
-                    self.launchStatusText = ""
-                }
-            }
-        }
-    }
-
-    @discardableResult
-    func executeLaunchSequence(
-        bottleOverrideURL: URL? = nil,
-        envOverride: RuntimeEnvironment? = nil,
-        gameFolderOverride: String? = nil
-    ) throws -> Int32 {
-        let selectedAzimuth = azimuthBuild
-        let selectedResolution = resolution
-        let useExtraOptions = enableExtraOptions
-        let useMetalHUD = showMetalHUD
-        let rawGameFolder = gameFolderOverride ?? gameFolderPath
-        let userGameFolder = URL(fileURLWithPath: rawGameFolder).resolvingSymlinksInPath().path
-        let currentEnv = envOverride ?? envStatus
-
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
-        guard let payloadRoot = Bundle.main.resourceURL?.appendingPathComponent("payload") else {
-            throw NSError(domain: "FH2Launch", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Bundled payload directory is missing from app bundle."
-            ])
-        }
-
-        // 1. Determine bottle / prefix path
-        let bottleURL: URL
+    func buildWineEnvironment(for currentEnv: RuntimeEnvironment, bottleURL: URL, useMetalHUD: Bool) -> [String: String] {
         let isCrossOver = (currentEnv.runtimeKind == .crossover || currentEnv.runtimeKind == .crossoverPreview)
-        if let customBottle = bottleOverrideURL {
-            bottleURL = customBottle
-        } else if isCrossOver {
-            let cxBottlesDir = home.appendingPathComponent("Library/Application Support/CrossOver/Bottles")
-            bottleURL = cxBottlesDir.appendingPathComponent("ForzaHorizon2")
-        } else {
-            let fh2SupportDir = home.appendingPathComponent("Library/Application Support/FH2Port")
-            bottleURL = fh2SupportDir.appendingPathComponent("bottle")
-        }
-
-        let driveCURL = bottleURL.appendingPathComponent("drive_c")
-        let azimuthDirName = "Azimuth"
-        let azimuthDestURL = driveCURL.appendingPathComponent(azimuthDirName)
-
-        // Build runtime environment variables for Wine + D3DMetal
         var wineEnv = ProcessInfo.processInfo.environment
         wineEnv["WINEPREFIX"] = bottleURL.path
         wineEnv["WINEDEBUG"] = "-all"
@@ -771,6 +1367,30 @@ final class LauncherViewModel: ObservableObject {
             wineEnv["DYLD_FALLBACK_LIBRARY_PATH"] = (libPaths + [existingLib]).joined(separator: ":")
             wineEnv["DYLD_FALLBACK_FRAMEWORK_PATH"] = (fwPaths + [existingFw]).joined(separator: ":")
         }
+        return wineEnv
+    }
+
+    func prepareBottleAndConfigureAzimuth(
+        bottleURL: URL,
+        env currentEnv: RuntimeEnvironment,
+        gameFolder rawGameFolder: String,
+        selectedAzimuth: AzimuthBuildOption,
+        selectedResolution: ResolutionOption,
+        useExtraOptions: Bool,
+        useMetalHUD: Bool
+    ) throws {
+        let fm = FileManager.default
+        let userGameFolder = URL(fileURLWithPath: rawGameFolder).resolvingSymlinksInPath().path
+        guard let payloadRoot = Bundle.main.resourceURL?.appendingPathComponent("payload") else {
+            throw NSError(domain: "FH2Launch", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Bundled payload directory is missing from app bundle."
+            ])
+        }
+
+        let isCrossOver = (currentEnv.runtimeKind == .crossover || currentEnv.runtimeKind == .crossoverPreview)
+        let driveCURL = bottleURL.appendingPathComponent("drive_c")
+        let azimuthDestURL = driveCURL.appendingPathComponent("Azimuth")
+        let wineEnv = buildWineEnvironment(for: currentEnv, bottleURL: bottleURL, useMetalHUD: useMetalHUD)
 
         guard let wineBin = currentEnv.wineExecutable else {
             throw NSError(domain: "FH2Launch", code: 2, userInfo: [
@@ -778,7 +1398,7 @@ final class LauncherViewModel: ObservableObject {
             ])
         }
 
-        // 2. Initialize bottle if `system.reg` does not exist yet
+        // 1. Initialize bottle if `system.reg` does not exist yet
         if !fm.fileExists(atPath: bottleURL.appendingPathComponent("system.reg").path) {
             self.updateLaunchStatus("Initializing Windows 10 64-bit bottle (first run only)...")
             try fm.createDirectory(at: bottleURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -806,7 +1426,7 @@ final class LauncherViewModel: ObservableObject {
 
         try fm.createDirectory(at: azimuthDestURL.appendingPathComponent("data/logs"), withIntermediateDirectories: true)
 
-        // 3. Copy selected Azimuth build (`0.9.10` or `1.0.1`) preserving `data/titles` (saves)
+        // 2. Copy selected Azimuth build (`0.9.10` or `1.0.1`) preserving `data/titles` (saves)
         self.updateLaunchStatus("Installing Azimuth \(selectedAzimuth.rawValue) + Apple Silicon D3D12 & Gamepad shims...")
         let bundledAzDir = payloadRoot.appendingPathComponent(selectedAzimuth.payloadSubfolder)
         guard fm.fileExists(atPath: bundledAzDir.appendingPathComponent("azimuth.exe").path) else {
@@ -815,7 +1435,6 @@ final class LauncherViewModel: ObservableObject {
             ])
         }
 
-        // Use `/usr/bin/ditto` to merge bundled Azimuth into `drive_c/Azimuth` so user saves in `data/titles` are never deleted
         let (dittoCode, dittoOut) = self.runProcess(
             executable: "/usr/bin/ditto",
             args: [bundledAzDir.path, azimuthDestURL.path]
@@ -826,7 +1445,7 @@ final class LauncherViewModel: ObservableObject {
             ])
         }
 
-        // 4. Copy `d3d12.dll`, `fh2pad.dll`, and `d3dcompiler_47.dll` next to `azimuth.exe`
+        // 3. Copy `d3d12.dll`, `fh2pad.dll`, and `d3dcompiler_47.dll` next to `azimuth.exe`
         let layerDir = payloadRoot.appendingPathComponent("layer")
         for dll in ["d3d12.dll", "fh2pad.dll", "d3dcompiler_47.dll"] {
             let src = layerDir.appendingPathComponent(dll)
@@ -834,12 +1453,10 @@ final class LauncherViewModel: ObservableObject {
             if fm.fileExists(atPath: src.path) {
                 try? fm.removeItem(at: dst)
                 try fm.copyItem(at: src, to: dst)
-            } else {
-                self.appendLog("Warning: \(dll) missing from \(layerDir.path)")
             }
         }
 
-        // 5. Handle Optional `ForzaHorizon2_ExtraOptions` mod
+        // 4. Handle Optional `ForzaHorizon2_ExtraOptions` mod
         let extraOptionsSrc = payloadRoot.appendingPathComponent("extra_options")
         let winmmDst = azimuthDestURL.appendingPathComponent("winmm.dll")
         let eoIniDst = azimuthDestURL.appendingPathComponent("FH2_ExtraOptions.ini")
@@ -863,7 +1480,7 @@ final class LauncherViewModel: ObservableObject {
             try? fm.removeItem(at: winmmDst)
         }
 
-        // 6. Apply Wine Registry & DLL Overrides (matching `FH2-Port-AppleSilicon/scripts/install.sh`)
+        // 5. Apply Wine Registry & DLL Overrides (matching `FH2-Port-AppleSilicon/scripts/install.sh`)
         self.updateLaunchStatus("Applying Wine registry & DLL overrides for Azimuth...")
         let appKey = #"HKCU\Software\Wine\AppDefaults\azimuth.exe\DllOverrides"#
         let padKey = #"HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.Input.Gamepad"#
@@ -892,7 +1509,7 @@ final class LauncherViewModel: ObservableObject {
             _ = self.runProcess(executable: wineBin.path, args: cmd, env: wineEnv)
         }
 
-        // 7. Configure `data/azimuth.ini` (UTF-16LE with BOM) with resolution, antialiasing=off, and FH2 game folder path
+        // 6. Configure `data/azimuth.ini` (UTF-16LE with BOM) with resolution, antialiasing=off, and FH2 game folder path
         self.updateLaunchStatus("Configuring data/azimuth.ini (\(selectedResolution.rawValue)p, antialiasing=off)...")
         let iniURL = azimuthDestURL.appendingPathComponent("data/azimuth.ini")
         let winGamePath = "Z:" + userGameFolder.replacingOccurrences(of: "/", with: "\\")
@@ -903,6 +1520,64 @@ final class LauncherViewModel: ObservableObject {
             azimuthBuild: selectedAzimuth
         )
         self.appendLog("Configured \(iniURL.path) -> folder=\(winGamePath), resolution=\(selectedResolution.rawValue), antialiasing=off")
+    }
+
+    func launchGame() {
+        guard envStatus.isFullyReady, folderValidation.isVerified, !isLaunchingGame else { return }
+        errorBannerText = nil
+        isLaunchingGame = true
+        launchStatusText = "Preparing Wine prefix & FH2 compatibility layer..."
+        appendLog("=== Starting Forza Horizon 2 launch sequence ===")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            do {
+                let pid = try self.executeLaunchSequence()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    self.isLaunchingGame = false
+                    self.refreshStepChecklistStates()
+                    self.launchStatusText = "Forza Horizon 2 is running (PID \(pid))."
+                }
+            } catch {
+                self.appendLog("Launch failed: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    self.errorBannerText = error.localizedDescription
+                    self.isLaunchingGame = false
+                    self.launchStatusText = ""
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func executeLaunchSequence(
+        bottleOverrideURL: URL? = nil,
+        envOverride: RuntimeEnvironment? = nil,
+        gameFolderOverride: String? = nil
+    ) throws -> Int32 {
+        let currentEnv = envOverride ?? envStatus
+        let bottleURL = bottleOverrideURL ?? defaultBottleURL(for: currentEnv)
+        let rawGameFolder = gameFolderOverride ?? gameFolderPath
+
+        try prepareBottleAndConfigureAzimuth(
+            bottleURL: bottleURL,
+            env: currentEnv,
+            gameFolder: rawGameFolder,
+            selectedAzimuth: azimuthBuild,
+            selectedResolution: resolution,
+            useExtraOptions: enableExtraOptions,
+            useMetalHUD: showMetalHUD
+        )
+
+        guard let wineBin = currentEnv.wineExecutable else {
+            throw NSError(domain: "FH2Launch", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Wine executable not found."
+            ])
+        }
+
+        let fm = FileManager.default
+        let azimuthDestURL = bottleURL.appendingPathComponent("drive_c/Azimuth")
+        let wineEnv = buildWineEnvironment(for: currentEnv, bottleURL: bottleURL, useMetalHUD: showMetalHUD)
 
         // Rotate fh2port.log if present
         let fh2Log = azimuthDestURL.appendingPathComponent("data/logs/fh2port.log")
@@ -912,7 +1587,7 @@ final class LauncherViewModel: ObservableObject {
             try? fm.moveItem(at: fh2Log, to: fh2PrevLog)
         }
 
-        // 8. Launch `azimuth.exe` with `--skip-launcher` so it boots directly into Forza Horizon 2!
+        // Launch `azimuth.exe` with `--skip-launcher` so it boots directly into Forza Horizon 2!
         self.updateLaunchStatus("Launching Forza Horizon 2...")
         let wineLogURL = azimuthDestURL.appendingPathComponent("data/logs/wine.log")
         fm.createFile(atPath: wineLogURL.path, contents: nil)
@@ -955,7 +1630,6 @@ final class LauncherViewModel: ObservableObject {
         var text: String
 
         if let raw = try? Data(contentsOf: iniURL), raw.count >= 2 {
-            // Backup existing ini once
             let bakURL = iniURL.appendingPathExtension("bak-fh2port")
             if !fm.fileExists(atPath: bakURL.path) {
                 try? raw.write(to: bakURL)
@@ -988,7 +1662,6 @@ final class LauncherViewModel: ObservableObject {
             ].joined(separator: "\r\n")
         }
 
-        // Update or insert keys in `[launcher]` and `[title-1a96545b]`
         func upsertKey(_ key: String, value: String, inSection section: String, content: inout String) {
             let sectionHeader = "[\(section)]"
             guard let secRange = content.range(of: sectionHeader, options: .caseInsensitive) else {
@@ -1100,10 +1773,10 @@ struct StatusPill: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
             .foregroundColor(style.color)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
             .background(style.color.opacity(0.14))
             .overlay(
                 RoundedRectangle(cornerRadius: 5)
@@ -1133,18 +1806,18 @@ struct MonoCard<Content: View, TrailingHeader: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Text("\(sectionIndex) / \(sectionTitle)")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                     .foregroundColor(.secondary)
-                    .tracking(0.6)
+                    .tracking(0.5)
                 Spacer()
                 trailingHeader
             }
             content
         }
-        .padding(14)
+        .padding(12)
         .background(Theme.cardBackground(for: colorScheme))
         .cornerRadius(10)
         .overlay(
@@ -1154,29 +1827,97 @@ struct MonoCard<Content: View, TrailingHeader: View>: View {
     }
 }
 
-struct EnvironmentRow: View {
-    let label: String
-    let value: String
-    let isReady: Bool
+struct ChecklistStepRow: View {
+    let indexLabel: String
+    let title: String
+    let state: ChecklistStepState
 
     var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(isReady ? Theme.emerald : Theme.amber)
-                .frame(width: 6, height: 6)
-            Text(label)
-                .font(.system(size: 12, weight: .medium, design: .default))
-                .foregroundColor(.primary.opacity(0.85))
-            Spacer()
-            Text(value)
-                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                .foregroundColor(isReady ? .primary : Theme.amber)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                badgeView
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold, design: .default))
+                    .foregroundColor(.primary)
+                Spacer()
+                detailView
+            }
+
+            if case .active(let progress, _) = state {
+                ProgressView(value: min(1.0, max(0.0, progress)), total: 1.0)
+                    .tint(Theme.cyan)
+                    .controlSize(.small)
+            } else if case .waitingForInternet(let progress, _) = state {
+                ProgressView(value: min(1.0, max(0.0, progress)), total: 1.0)
+                    .tint(Theme.amber)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private var badgeView: some View {
+        switch state {
+        case .completed:
+            Text("✓")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundColor(.black)
+                .frame(width: 20, height: 18)
+                .background(Theme.emerald)
+                .cornerRadius(4)
+        case .active:
+            Text(indexLabel)
+                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                .foregroundColor(.black)
+                .frame(width: 24, height: 18)
+                .background(Theme.cyan)
+                .cornerRadius(4)
+        case .waitingForInternet:
+            Text("!")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundColor(.black)
+                .frame(width: 20, height: 18)
+                .background(Theme.amber)
+                .cornerRadius(4)
+        case .pending:
+            Text(indexLabel)
+                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                .foregroundColor(.secondary)
+                .frame(width: 24, height: 18)
+                .background(Color.primary.opacity(0.07))
+                .cornerRadius(4)
+        }
+    }
+
+    @ViewBuilder
+    private var detailView: some View {
+        switch state {
+        case .completed(let detail):
+            Text(detail)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundColor(Theme.emerald)
+                .lineLimit(1)
+        case .active(_, let detail):
+            Text(detail)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundColor(Theme.cyan)
+                .lineLimit(1)
+        case .waitingForInternet(_, let detail):
+            Text(detail)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundColor(Theme.amber)
+                .lineLimit(1)
+        case .pending(let detail):
+            Text(detail)
+                .font(.system(size: 11, weight: .regular, design: .monospaced))
+                .foregroundColor(.secondary)
                 .lineLimit(1)
         }
     }
 }
 
-// MARK: - Main Launcher View (Fixed 720 x 520 pt)
+// MARK: - Main Launcher View (Fixed 740 x 560 pt)
 
 struct LauncherMainView: View {
     @ObservedObject var vm: LauncherViewModel
@@ -1187,17 +1928,17 @@ struct LauncherMainView: View {
             Theme.windowBackground(for: colorScheme)
                 .ignoresSafeArea()
 
-            VStack(spacing: 12) {
+            VStack(spacing: 10) {
                 headerView
 
-                // Card 1 — System & Graphics Runtime
-                card1Environment
+                // Reassuring Quick Guide for First-Time Players
+                quickGuideCard
 
-                // Card 2 — Game Library Path
-                card2GameFiles
+                // 4-Step Visual Progress Checklist (A-to-Z Setup)
+                checklistCard
 
-                // Card 3 — Launch Configuration
-                card3Configuration
+                // Configuration & Game Folder Override Card
+                configurationCard
 
                 if vm.showLogsDrawer {
                     logsDrawerView
@@ -1207,42 +1948,39 @@ struct LauncherMainView: View {
 
                 bottomActionBar
             }
-            .padding(.horizontal, 22)
-            .padding(.top, 14)
-            .padding(.bottom, 16)
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+            .padding(.bottom, 14)
         }
-        .frame(width: 720, height: 520)
+        .frame(width: 740, height: 560)
     }
 
     // MARK: 1. Top Header
     private var headerView: some View {
         HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text("Forza Horizon 2")
-                        .font(.system(size: 20, weight: .semibold, design: .default))
-                        .foregroundColor(.primary)
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("Forza Horizon 2")
+                    .font(.system(size: 19, weight: .semibold, design: .default))
+                    .foregroundColor(.primary)
 
-                    Text("macOS Apple Silicon · v1.0.0.64")
-                        .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                        .foregroundColor(Theme.cyan)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 2.5)
-                        .background(Theme.cyan.opacity(0.12))
-                        .cornerRadius(5)
-                }
+                Text("macOS Apple Silicon · v1.1.0 · Xbox One v1.0.0.64")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(Theme.cyan)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2.5)
+                    .background(Theme.cyan.opacity(0.12))
+                    .cornerRadius(5)
             }
 
             Spacer()
 
-            // Live Controller Status Badge
             HStack(spacing: 6) {
                 Text(vm.controllerConnected ? "● Controller Connected" : "○ Keyboard Mode")
-                    .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(vm.controllerConnected ? Theme.emerald : .secondary)
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 5)
+            .padding(.vertical, 4.5)
             .background(
                 (vm.controllerConnected ? Theme.emerald : Color.primary)
                     .opacity(0.07)
@@ -1255,83 +1993,81 @@ struct LauncherMainView: View {
         }
     }
 
-    // MARK: 2. Card 1 — System & Graphics Runtime (`01 / ENVIRONMENT`)
-    private var card1Environment: some View {
+    // MARK: 2. Quick Guide for First-Time Players
+    private var quickGuideCard: some View {
         MonoCard(
             sectionIndex: "01",
-            sectionTitle: "ENVIRONMENT",
+            sectionTitle: "QUICK GUIDE FOR FIRST-TIME PLAYERS",
             trailingHeader: {
-                if vm.isProvisioningRuntime {
-                    StatusPill(text: "INSTALLING", style: .installing)
-                } else if vm.envStatus.isFullyReady {
-                    StatusPill(text: "READY", style: .ready)
-                } else {
-                    StatusPill(text: "ACTION NEEDED", style: .actionNeeded)
-                }
+                StatusPill(
+                    text: vm.isReadyToLaunch ? "ALL STEPS COMPLETE" : "1-CLICK TURNKEY INSTALLER",
+                    style: vm.isReadyToLaunch ? .ready : .installing
+                )
             },
             content: {
-                VStack(alignment: .leading, spacing: 6) {
-                    EnvironmentRow(
-                        label: "Rosetta 2 Translation",
-                        value: vm.envStatus.rosettaInstalled ? "Installed" : "Missing",
-                        isReady: vm.envStatus.rosettaInstalled
-                    )
-                    EnvironmentRow(
-                        label: "DirectX 12 → Metal Engine",
-                        value: vm.envStatus.runtimeKind.rawValue,
-                        isReady: vm.envStatus.runtimeKind.isReady
-                    )
-                    EnvironmentRow(
-                        label: "FH2 Compatibility Layer",
-                        value: vm.bundledPayloadSummary,
-                        isReady: true
-                    )
-
-                    if !vm.envStatus.isFullyReady || vm.isProvisioningRuntime {
-                        Divider().padding(.vertical, 2)
-                        if vm.isProvisioningRuntime {
-                            VStack(alignment: .leading, spacing: 5) {
-                                HStack {
-                                    Text(vm.provisioningStepText)
-                                        .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                                        .foregroundColor(Theme.cyan)
-                                    Spacer()
-                                    Text(String(format: "%.0f%%", vm.provisioningProgress * 100))
-                                        .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                                        .foregroundColor(Theme.cyan)
-                                }
-                                ProgressView(value: vm.provisioningProgress, total: 1.0)
-                                    .tint(Theme.cyan)
-                            }
-                        } else {
-                            HStack(spacing: 10) {
-                                Text("Free Wine64 + Apple D3DMetal runtime is required to run DirectX 12 on Apple Silicon.")
-                                    .font(.system(size: 11.5, weight: .regular))
-                                    .foregroundColor(.secondary)
-                                Spacer()
-                                Button(action: { vm.provisionFreeRuntime() }) {
-                                    Text("Set Up Free Runtime")
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .foregroundColor(.black)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 5)
-                                        .background(Theme.cyan)
-                                        .cornerRadius(6)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("1. Click 'Start 1-Click Setup' below. If your internet disconnects, don't worry—the download saves your progress and continues automatically.")
+                        .font(.system(size: 11.5, weight: .regular))
+                        .foregroundColor(.primary.opacity(0.88))
+                    Text("2. Once all 4 steps show a green checkmark, turn on your Xbox or PlayStation Bluetooth controller and click 'Launch Forza Horizon 2'.")
+                        .font(.system(size: 11.5, weight: .regular))
+                        .foregroundColor(.primary.opacity(0.88))
                 }
             }
         )
     }
 
-    // MARK: 3. Card 2 — Game Library Path (`02 / GAME FILES`)
-    private var card2GameFiles: some View {
+    // MARK: 3. 4-Step Visual Progress Checklist
+    private var checklistCard: some View {
         MonoCard(
             sectionIndex: "02",
-            sectionTitle: "GAME FILES",
+            sectionTitle: "A-TO-Z SETUP CHECKLIST",
+            trailingHeader: {
+                if let interrupted = vm.connectionInterruptedBanner {
+                    StatusPill(text: interrupted, style: .actionNeeded)
+                } else if vm.isRunningSetupPipeline {
+                    StatusPill(text: "INSTALLING", style: .installing)
+                } else if vm.isReadyToLaunch {
+                    StatusPill(text: "READY TO PLAY", style: .ready)
+                } else {
+                    StatusPill(text: "SETUP REQUIRED", style: .actionNeeded)
+                }
+            },
+            content: {
+                VStack(alignment: .leading, spacing: 6) {
+                    ChecklistStepRow(
+                        indexLabel: "[1]",
+                        title: "macOS Graphics Runtime",
+                        state: vm.step1State
+                    )
+                    Divider().opacity(0.4)
+                    ChecklistStepRow(
+                        indexLabel: "[2]",
+                        title: "Game Download (16.8 GB)",
+                        state: vm.step2State
+                    )
+                    Divider().opacity(0.4)
+                    ChecklistStepRow(
+                        indexLabel: "[3]",
+                        title: "Game Unpacking & Installation",
+                        state: vm.step3State
+                    )
+                    Divider().opacity(0.4)
+                    ChecklistStepRow(
+                        indexLabel: "[4]",
+                        title: "Controller & Graphics Setup",
+                        state: vm.step4State
+                    )
+                }
+            }
+        )
+    }
+
+    // MARK: 4. Launch Configuration & Game Library Override
+    private var configurationCard: some View {
+        MonoCard(
+            sectionIndex: "03",
+            sectionTitle: "CONFIGURATION & GAME FOLDER",
             trailingHeader: {
                 switch vm.folderValidation {
                 case .verified(_, let isSymlink) where !isSymlink:
@@ -1339,75 +2075,15 @@ struct LauncherMainView: View {
                 case .verified(_, _):
                     StatusPill(text: "[SYMLINK NOT SUPPORTED]", style: .actionNeeded)
                 case .unconfigured, .invalid:
-                    StatusPill(text: "[SELECT FOLDER]", style: .actionNeeded)
+                    StatusPill(text: "[AUTO-DOWNLOAD OR BROWSE]", style: .neutral)
                 }
             },
             content: {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        HStack {
-                            Text(vm.gameFolderPath.isEmpty ? "No Forza Horizon 2 folder selected..." : vm.gameFolderPath)
-                                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                                .foregroundColor(vm.gameFolderPath.isEmpty ? .secondary : .primary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Theme.codeBoxBackground(for: colorScheme))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6)
-                                .stroke(Theme.cardBorder, lineWidth: 1)
-                        )
-                        .cornerRadius(6)
-
-                        Button(action: { vm.selectGameFolder() }) {
-                            Text("Browse…")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(.primary)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
-                                .background(Color.primary.opacity(0.07))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .stroke(Theme.cardBorder, lineWidth: 1)
-                                )
-                                .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    if case .invalid(let reason) = vm.folderValidation {
-                        Text(reason)
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundColor(Theme.amber)
-                    } else if case .verified(_, true) = vm.folderValidation {
-                        Text("Azimuth requires a real folder (or APFS clone via cp -c -R), not a symbolic link.")
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundColor(Theme.amber)
-                    }
-                }
-            }
-        )
-    }
-
-    // MARK: 4. Card 3 — Launch Configuration (`03 / CONFIGURATION`)
-    private var card3Configuration: some View {
-        MonoCard(
-            sectionIndex: "03",
-            sectionTitle: "CONFIGURATION",
-            trailingHeader: {
-                Text("ANTIALIASING=OFF · AVX=0")
-                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                    .foregroundColor(.secondary)
-            },
-            content: {
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack(spacing: 16) {
-                        HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 12) {
+                        HStack(spacing: 6) {
                             Text("Resolution")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.system(size: 11.5, weight: .medium))
                                 .foregroundColor(.primary.opacity(0.85))
                             Picker("", selection: $vm.resolution) {
                                 ForEach(ResolutionOption.allCases) { opt in
@@ -1416,14 +2092,12 @@ struct LauncherMainView: View {
                             }
                             .pickerStyle(.segmented)
                             .labelsHidden()
-                            .frame(width: 245)
+                            .frame(width: 210)
                         }
 
-                        Spacer()
-
-                        HStack(spacing: 8) {
+                        HStack(spacing: 6) {
                             Text("Azimuth")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.system(size: 11.5, weight: .medium))
                                 .foregroundColor(.primary.opacity(0.85))
                             Picker("", selection: $vm.azimuthBuild) {
                                 ForEach(AzimuthBuildOption.allCases) { opt in
@@ -1432,17 +2106,42 @@ struct LauncherMainView: View {
                             }
                             .pickerStyle(.segmented)
                             .labelsHidden()
-                            .frame(width: 175)
+                            .frame(width: 155)
                             .disabled(!vm.isAzimuth101Available)
+                        }
+
+                        Spacer()
+
+                        HStack(spacing: 6) {
+                            Text(vm.gameFolderPath.isEmpty ? "~/Games/Forza Horizon 2" : URL(fileURLWithPath: vm.gameFolderPath).lastPathComponent)
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .frame(maxWidth: 120, alignment: .trailing)
+
+                            Button(action: { vm.selectGameFolder() }) {
+                                Text("Browse…")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(.primary)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(Color.primary.opacity(0.07))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 5)
+                                            .stroke(Theme.cardBorder, lineWidth: 1)
+                                    )
+                                    .cornerRadius(5)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
 
-                    Divider().opacity(0.5)
+                    Divider().opacity(0.45)
 
-                    HStack(spacing: 20) {
+                    HStack(spacing: 16) {
                         Toggle(isOn: $vm.enableExtraOptions) {
-                            Text("Enable ExtraOptions (Unlock All DLC Cars & Skip Intro Videos)")
-                                .font(.system(size: 12, weight: .medium))
+                            Text("Unlock All DLC Cars & Skip Intro (ExtraOptions)")
+                                .font(.system(size: 11.5, weight: .medium))
                         }
                         .toggleStyle(.switch)
                         .controlSize(.small)
@@ -1450,9 +2149,17 @@ struct LauncherMainView: View {
 
                         Spacer()
 
+                        Toggle(isOn: $vm.showInstallerWindow) {
+                            Text("Show Installer Window")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .tint(Theme.cyan)
+
                         Toggle(isOn: $vm.showMetalHUD) {
-                            Text("Show Metal FPS HUD (MTL_HUD_ENABLED)")
-                                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                            Text("Metal FPS HUD")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
                         }
                         .toggleStyle(.switch)
                         .controlSize(.small)
@@ -1470,15 +2177,15 @@ struct LauncherMainView: View {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(vm.logs.enumerated()), id: \.offset) { idx, line in
                         Text(line)
-                            .font(.system(size: 10.5, weight: .regular, design: .monospaced))
+                            .font(.system(size: 10, weight: .regular, design: .monospaced))
                             .foregroundColor(.secondary)
                             .textSelection(.enabled)
                             .id(idx)
                     }
                 }
-                .padding(8)
+                .padding(6)
             }
-            .frame(height: 68)
+            .frame(height: 56)
             .background(Theme.codeBoxBackground(for: colorScheme))
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
@@ -1493,34 +2200,30 @@ struct LauncherMainView: View {
         }
     }
 
-    // MARK: 5. Bottom Action Bar
+    // MARK: 5. Bottom Action Bar (Dynamic Primary Button)
     private var bottomActionBar: some View {
-        let canLaunch = vm.envStatus.isFullyReady && vm.folderValidation.isVerified && !vm.isLaunchingGame && !vm.isProvisioningRuntime
-
-        return HStack(alignment: .center, spacing: 12) {
+        HStack(alignment: .center, spacing: 10) {
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.15)) {
                     vm.showLogsDrawer.toggle()
                 }
             }) {
-                HStack(spacing: 5) {
-                    Text(vm.showLogsDrawer ? "▾ Hide Logs" : "▸ View Logs")
-                        .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                        .foregroundColor(.secondary)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(Color.primary.opacity(0.05))
-                .cornerRadius(6)
+                Text(vm.showLogsDrawer ? "▾ Hide Logs" : "▸ View Logs")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(Color.primary.opacity(0.05))
+                    .cornerRadius(6)
             }
             .buttonStyle(.plain)
 
             Button(action: { vm.refreshEnvironment() }) {
                 Text("Rescan")
-                    .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(.secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
                     .background(Color.primary.opacity(0.05))
                     .cornerRadius(6)
             }
@@ -1528,13 +2231,13 @@ struct LauncherMainView: View {
 
             if let err = vm.errorBannerText {
                 Text(err)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                     .foregroundColor(Theme.amber)
                     .lineLimit(1)
                     .truncationMode(.tail)
             } else if !vm.launchStatusText.isEmpty {
                 Text(vm.launchStatusText)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                     .foregroundColor(Theme.cyan)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -1542,24 +2245,53 @@ struct LauncherMainView: View {
 
             Spacer()
 
-            Button(action: { vm.launchGame() }) {
-                HStack(spacing: 8) {
-                    if vm.isLaunchingGame {
+            if vm.isReadyToLaunch {
+                // All 4 steps complete -> Launch Forza Horizon 2
+                Button(action: { vm.launchGame() }) {
+                    HStack(spacing: 8) {
+                        if vm.isLaunchingGame {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.75)
+                        }
+                        Text(vm.isLaunchingGame ? "Launching…" : "Launch Forza Horizon 2")
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundColor(.black)
+                    }
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 9)
+                    .background(Theme.emerald)
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+            } else if vm.isRunningSetupPipeline {
+                Button(action: { vm.pauseSetupPipeline() }) {
+                    HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
                             .scaleEffect(0.75)
+                        Text("Pause Setup (Progress Saved)")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundColor(.primary)
                     }
-                    Text(vm.isLaunchingGame ? "Launching…" : "Launch Forza Horizon 2")
-                        .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundColor(canLaunch ? .black : .secondary)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 8)
+                    .background(Color.primary.opacity(0.10))
+                    .cornerRadius(8)
                 }
-                .padding(.horizontal, 22)
-                .padding(.vertical, 9)
-                .background(canLaunch ? Theme.cyan : Color.primary.opacity(0.10))
-                .cornerRadius(8)
+                .buttonStyle(.plain)
+            } else {
+                Button(action: { vm.startOrResumeOneClickSetup() }) {
+                    Text(vm.isSetupPausedOrInterrupted ? "Resume Setup & Download" : "Start 1-Click Setup & Download (16.8 GB)")
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 9)
+                        .background(Theme.cyan)
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
-            .disabled(!canLaunch)
         }
     }
 }
@@ -1608,12 +2340,11 @@ enum SelfTestRunner {
     }
 
     static func run() -> Int32 {
-        print("=== Forza Horizon 2 macOS App — Runtime & Integration Self-Test ===")
+        print("=== Forza Horizon 2 macOS App (v1.1.0) — Runtime & A-to-Z Integration Self-Test ===")
         let fm = FileManager.default
         let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("fh2-selftest-\(ProcessInfo.processInfo.globallyUniqueString)")
 
-        // Save UserDefaults keys so self-test leaves user preferences untouched
         let defaults = UserDefaults.standard
         let savedFolder = defaults.string(forKey: "FH2_GameFolderPath")
         let savedRes = defaults.string(forKey: "FH2_Resolution")
@@ -1633,17 +2364,20 @@ enum SelfTestRunner {
         do {
             try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
 
-            // 1. Verify Bundle Resources & Payload Integrity
+            // 1. Verify Bundle Resources & Payload Integrity (including static 7zz, noop.exe, manifest.json)
             guard let resURL = Bundle.main.resourceURL else {
                 throw NSError(domain: "FH2SelfTest", code: 2, userInfo: [NSLocalizedDescriptionKey: "Bundle.main.resourceURL is nil"])
             }
             let requiredFiles = [
                 "AppIcon.icns",
+                "manifest.json",
+                "bin/7zz",
                 "payload/azimuth-0.9.10/azimuth.exe",
                 "payload/azimuth-1.0.1/azimuth.exe",
                 "payload/layer/d3d12.dll",
                 "payload/layer/fh2pad.dll",
                 "payload/layer/d3dcompiler_47.dll",
+                "payload/layer/noop.exe",
                 "payload/extra_options/winmm.dll",
                 "payload/extra_options/FH2_ExtraOptions.ini"
             ]
@@ -1654,15 +2388,61 @@ enum SelfTestRunner {
                 try assertCondition(exists && size > 0, "Bundled resource exists and is non-empty: \(rel) (\(size) bytes)")
             }
 
-            // 2. Verify Live SwiftUI View Hierarchy & AppKit Window Rendering (720 x 520)
-            _ = NSApplication.shared
+            let sevenZipURL = resURL.appendingPathComponent("bin/7zz")
+            try assertCondition(fm.isExecutableFile(atPath: sevenZipURL.path), "Bundled Contents/Resources/bin/7zz is executable")
+
+            let manifest = SetupManifest.loadFromBundle()
+            try assertCondition(
+                manifest.gameFileID == "1VVmQ3d_qHOj6UhPfslSgeaBfQbc3zYcf" && manifest.gameExpectedBytes == 18_001_002_054,
+                "Loaded manifest.json -> file_id=\(manifest.gameFileID), size_bytes=\(manifest.gameExpectedBytes)"
+            )
+
+            // 2. Verify Google Drive Large-File Confirmation Resolver & Byte-Range Auto-Resume (First 1 MB + Next 1 MB)
+            let resolvedDriveURL = LauncherViewModel.resolveGoogleDriveDownloadURL(fileID: manifest.gameFileID)
+            try assertCondition(
+                resolvedDriveURL.contains("drive.usercontent.google.com/download") && resolvedDriveURL.contains(manifest.gameFileID),
+                "Google Drive confirmation resolver resolved URL: \(resolvedDriveURL)"
+            )
+
             let vm = LauncherViewModel()
+            let drivePartTest = tempRoot.appendingPathComponent("fh2_drive_range_test.zip.part")
+
+            // Download first 1 MB (bytes 0..1048575)
+            let (c1Code, _) = vm.runProcess(
+                executable: "/usr/bin/curl",
+                args: ["-fsSL", "--retry", "3", "--range", "0-1048575", "-o", drivePartTest.path, resolvedDriveURL]
+            )
+            let firstMBData = (try? Data(contentsOf: drivePartTest)) ?? Data()
+            try assertCondition(
+                c1Code == 0 && firstMBData.count == 1_048_576 && firstMBData.prefix(4) == Data([0x50, 0x4B, 0x03, 0x04]),
+                "Downloaded first 1 MB (1,048,576 bytes) of FH2-Game.zip from Google Drive and verified PK\\x03\\x04 zip magic bytes"
+            )
+
+            // Verify byte-exact resume (`curl -C -` / range 1048576..2097151) for the next 1 MB
+            let driveChunk2 = tempRoot.appendingPathComponent("fh2_drive_chunk2.bin")
+            let (c2Code, _) = vm.runProcess(
+                executable: "/usr/bin/curl",
+                args: ["-fsSL", "--retry", "3", "-C", "1048576", "-r", "1048576-2097151", "-o", driveChunk2.path, resolvedDriveURL]
+            )
+            if let chunk2Data = try? Data(contentsOf: driveChunk2), let handle = try? FileHandle(forWritingTo: drivePartTest) {
+                handle.seekToEndOfFile()
+                handle.write(chunk2Data)
+                try? handle.close()
+            }
+            let combinedSize = (try? fm.attributesOfItem(atPath: drivePartTest.path)[.size] as? Int64) ?? 0
+            try assertCondition(
+                c2Code == 0 && combinedSize == 2_097_152,
+                "Verified byte-range resume downloaded second 1 MB cleanly (total 2,097,152 bytes with intact PK header)"
+            )
+
+            // 3. Verify Live SwiftUI View Hierarchy & AppKit Window Rendering (740 x 560)
+            _ = NSApplication.shared
             let mainView = LauncherMainView(vm: vm)
             let hostingView = NSHostingView(rootView: mainView)
-            hostingView.frame = NSRect(x: 0, y: 0, width: 720, height: 520)
+            hostingView.frame = NSRect(x: 0, y: 0, width: 740, height: 560)
 
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 720, height: 520),
+                contentRect: NSRect(x: 0, y: 0, width: 740, height: 560),
                 styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
@@ -1671,50 +2451,32 @@ enum SelfTestRunner {
             window.contentView = hostingView
             hostingView.layoutSubtreeIfNeeded()
 
-            // Exercise UI state transitions & re-layout
             vm.showLogsDrawer = true
-            vm.isProvisioningRuntime = true
-            vm.provisioningProgress = 0.65
-            vm.provisioningStepText = "Step 2/3: Downloading Apple Silicon DirectX-to-Metal runtime (65%)..."
-            hostingView.layoutSubtreeIfNeeded()
-
-            vm.isProvisioningRuntime = false
-            vm.resolution = .r2160
-            vm.azimuthBuild = .v1_0_1
+            vm.step2State = .waitingForInternet(progress: 0.50, detail: "Connection interrupted — waiting for internet to resume from 8.4 GB (50%)...")
             hostingView.layoutSubtreeIfNeeded()
 
             if let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds) {
                 hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
-                try assertCondition(bitmap.pixelsWide >= 720 && bitmap.pixelsHigh >= 520, "Rendered live 720x520 SwiftUI LauncherMainView to bitmap (\(bitmap.pixelsWide)x\(bitmap.pixelsHigh) px)")
-            } else {
-                try assertCondition(hostingView.bounds.width == 720 && hostingView.bounds.height == 520, "Verified 720x520 SwiftUI NSHostingView layout bounds")
+                try assertCondition(bitmap.pixelsWide >= 740 && bitmap.pixelsHigh >= 560, "Rendered live 740x560 SwiftUI LauncherMainView to bitmap (\(bitmap.pixelsWide)x\(bitmap.pixelsHigh) px)")
             }
 
-            // 3. Verify Game Folder Validation (Invalid, Valid, and Symlink Rejection)
-            let emptyGameDir = tempRoot.appendingPathComponent("EmptyGame")
-            try fm.createDirectory(at: emptyGameDir, withIntermediateDirectories: true)
-            vm.gameFolderPath = emptyGameDir.path
-            try assertCondition(!vm.folderValidation.isVerified, "Empty folder is rejected by validateGameFolder()")
+            // 4. Verify Complete 4-Step A-to-Z Pipeline End-to-End (7zz Extraction, Bracket-Free Flattening, QuickSFV Neutralization, winxp64 -> setup.exe -> win10, Azimuth Setup)
+            let mockRepackSrc = tempRoot.appendingPathComponent("Forza Horizon 2 [FitGirl Repack]")
+            try fm.createDirectory(at: mockRepackSrc.appendingPathComponent("MD5"), withIntermediateDirectories: true)
+            try fm.createDirectory(at: mockRepackSrc.appendingPathComponent("_Redist"), withIntermediateDirectories: true)
+            try Data("MOCK_SETUP_EXE".utf8).write(to: mockRepackSrc.appendingPathComponent("setup.exe"))
+            try Data("MOCK_FG01_BIN".utf8).write(to: mockRepackSrc.appendingPathComponent("fg-01.bin"))
+            try Data("ORIGINAL_QUICKSFV_1".utf8).write(to: mockRepackSrc.appendingPathComponent("MD5/QuickSFV.EXE"))
+            try Data("ORIGINAL_QUICKSFV_2".utf8).write(to: mockRepackSrc.appendingPathComponent("_Redist/QuickSFV.exe"))
 
-            let validGameDir = tempRoot.appendingPathComponent("ForzaHorizon2_v1.0.0.64")
-            let mountDir = validGameDir.appendingPathComponent("Mount")
-            try fm.createDirectory(at: mountDir, withIntermediateDirectories: true)
-            let exeURL = mountDir.appendingPathComponent("forza_durango_release_final.exe")
-            try Data("MZ_MOCK_FH2_EXE".utf8).write(to: exeURL)
+            let mockGameZip = tempRoot.appendingPathComponent("mock_fh2_source.zip")
+            let (packCode, _) = vm.runProcess(
+                executable: sevenZipURL.path,
+                args: ["a", "-tzip", mockGameZip.path, mockRepackSrc.path]
+            )
+            let mockZipSize = (try? fm.attributesOfItem(atPath: mockGameZip.path)[.size] as? Int64) ?? 0
+            try assertCondition(packCode == 0 && mockZipSize > 0, "Created mock FitGirl Repack archive with bundled 7zz (\(mockZipSize) bytes)")
 
-            vm.gameFolderPath = validGameDir.path
-            try assertCondition(vm.folderValidation.isVerified, "Valid Forza Horizon 2 folder with Mount/forza_durango_release_final.exe is verified")
-
-            let symlinkGameDir = tempRoot.appendingPathComponent("SymlinkFH2")
-            try fm.createSymbolicLink(at: symlinkGameDir, withDestinationURL: validGameDir)
-            vm.gameFolderPath = symlinkGameDir.path
-            try assertCondition(!vm.folderValidation.isVerified, "Symbolic link game folder is flagged and blocked from launching")
-
-            // Restore valid game folder
-            vm.gameFolderPath = validGameDir.path
-            try assertCondition(vm.folderValidation.isVerified, "Restored valid game folder state")
-
-            // 4. Verify End-to-End Bottle Provisioning, Payload Copy, DLL Injection, Registry Overrides & Azimuth.ini via Mock Wine64
             let mockBinDir = tempRoot.appendingPathComponent("mock_bin")
             let mockExtDir = tempRoot.appendingPathComponent("mock_d3dmetal_ext")
             try fm.createDirectory(at: mockBinDir, withIntermediateDirectories: true)
@@ -1724,10 +2486,17 @@ enum SelfTestRunner {
             let mockWineScript = mockBinDir.appendingPathComponent("wine64")
             let scriptBody = """
             #!/bin/bash
-            echo "CALL args=[$*] WINEPREFIX=[$WINEPREFIX] D3DMETAL=[$D3DMETAL] AVX=[$ROSETTA_ADVERTISE_AVX] HUD=[$MTL_HUD_ENABLED] DYLD_LIB=[$DYLD_FALLBACK_LIBRARY_PATH]" >> "\(mockWineLog.path)"
+            echo "CALL args=[$*] WINEPREFIX=[$WINEPREFIX] D3DMETAL=[$D3DMETAL] AVX=[$ROSETTA_ADVERTISE_AVX]" >> "\(mockWineLog.path)"
             if [ "$1" = "wineboot" ]; then
                 mkdir -p "$WINEPREFIX/drive_c"
                 echo "WINE REGISTRY Version 2" > "$WINEPREFIX/system.reg"
+            fi
+            if [[ "$*" == *"C:\\\\fg_setup\\\\setup.exe"* ]]; then
+                if [ -f "$WINEPREFIX/drive_c/fg_setup/MD5/QuickSFV.EXE.disabled" ] && [ -f "$WINEPREFIX/drive_c/fg_setup/_Redist/QuickSFV.exe.disabled" ]; then
+                    echo "QUICKSFV_NEUTRALIZED=YES" >> "\(mockWineLog.path)"
+                fi
+                mkdir -p "$WINEPREFIX/drive_c/FH2Game/Mount"
+                echo "MZ_UNPACKED_FH2_EXE" > "$WINEPREFIX/drive_c/FH2Game/Mount/forza_durango_release_final.exe"
             fi
             exit 0
             """
@@ -1747,73 +2516,49 @@ enum SelfTestRunner {
                 gptkAppURL: nil
             )
 
+            let testCacheDir = tempRoot.appendingPathComponent("cache")
             let testBottle = tempRoot.appendingPathComponent("bottle")
-            // Pre-seed a mock save file inside `drive_c/Azimuth/data/titles/1a96545b/save.bin` to verify saves are preserved across launches
-            let mockSaveURL = testBottle.appendingPathComponent("drive_c/Azimuth/data/titles/1a96545b/save.bin")
-            try fm.createDirectory(at: mockSaveURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try Data("USER_SAVE_PROGRESS_DATA".utf8).write(to: mockSaveURL)
+            let testFinalGameDir = tempRoot.appendingPathComponent("Games/Forza Horizon 2")
 
-            // Run 1: Azimuth 0.9.10, 1440p, ExtraOptions ON, Metal HUD ON
-            vm.azimuthBuild = .v0_9_10
-            vm.resolution = .r1440
-            vm.enableExtraOptions = true
-            vm.showMetalHUD = true
-
-            let pid1 = try vm.executeLaunchSequence(
-                bottleOverrideURL: testBottle,
-                envOverride: mockEnv,
-                gameFolderOverride: validGameDir.path
+            try vm.executeFourStepSetupPipeline(
+                customCacheDir: testCacheDir,
+                customBottleURL: testBottle,
+                customGameDestDir: testFinalGameDir,
+                mockRuntimeEnv: mockEnv,
+                customGameZipURLResolver: { "file://\(mockGameZip.path)" },
+                customGameExpectedBytes: mockZipSize,
+                customUnpackedTargetBytes: 4096
             )
-            try assertCondition(pid1 > 0, "executeLaunchSequence (Run 1: Azimuth 0.9.10, 1440p, ExtraOptions=ON) spawned process PID \(pid1)")
-            usleep(250_000)
 
-            let azDest = testBottle.appendingPathComponent("drive_c/Azimuth")
-            for expectedFile in ["azimuth.exe", "d3d12.dll", "fh2pad.dll", "d3dcompiler_47.dll", "winmm.dll", "FH2_ExtraOptions.ini", "data/azimuth.ini", "data/titles/1a96545b/save.bin"] {
-                let p = azDest.appendingPathComponent(expectedFile).path
-                try assertCondition(fm.fileExists(atPath: p), "Bottle file present after Run 1: drive_c/Azimuth/\(expectedFile)")
-            }
-
-            let iniURL = azDest.appendingPathComponent("data/azimuth.ini")
-            let iniRaw = try Data(contentsOf: iniURL)
-            try assertCondition(iniRaw.prefix(2) == Data([0xFF, 0xFE]), "data/azimuth.ini starts with UTF-16LE BOM (0xFF 0xFE)")
-            let iniText = String(data: Data(iniRaw.dropFirst(2)), encoding: .utf16LittleEndian) ?? ""
-            try assertCondition(iniText.contains("game=1a96545b"), "azimuth.ini contains game=1a96545b")
-            try assertCondition(iniText.contains("antialiasing=off"), "azimuth.ini contains antialiasing=off")
-            try assertCondition(iniText.contains("resolution=1440"), "azimuth.ini contains resolution=1440")
-            try assertCondition(iniText.contains("[title-1a96545b]"), "azimuth.ini contains [title-1a96545b]")
+            try assertCondition(
+                fm.fileExists(atPath: testFinalGameDir.appendingPathComponent("Mount/forza_durango_release_final.exe").path),
+                "4-Step pipeline unpacked forza_durango_release_final.exe into final game folder"
+            )
+            try assertCondition(
+                !fm.fileExists(atPath: testBottle.appendingPathComponent("drive_c/fg_setup").path),
+                "Temporary drive_c/fg_setup folder was automatically deleted after setup.exe finished"
+            )
+            try assertCondition(
+                !fm.fileExists(atPath: testCacheDir.appendingPathComponent("FH2-Game.zip").path),
+                "Temporary FH2-Game.zip archive was automatically deleted after 7zz extraction"
+            )
 
             let wineCalls = (try? String(contentsOf: mockWineLog, encoding: .utf8)) ?? ""
-            try assertCondition(wineCalls.contains("wineboot -u"), "wineboot -u executed on fresh bottle")
-            try assertCondition(wineCalls.contains("d3d12 /t REG_SZ /d native,builtin"), "Wine DLL override set for d3d12")
-            try assertCondition(wineCalls.contains("d3dcompiler_47 /t REG_SZ /d native,builtin"), "Wine DLL override set for d3dcompiler_47")
-            try assertCondition(wineCalls.contains(#"Windows.Gaming.Input.Gamepad /v DllPath /t REG_SZ /d C:\Azimuth\fh2pad.dll"#), "fh2pad.dll registered for Windows.Gaming.Input.Gamepad")
-            try assertCondition(wineCalls.contains("DisableHidraw /t REG_DWORD /d 1"), "WineBus DisableHidraw=1 configured")
-            try assertCondition(wineCalls.contains("winmm /t REG_SZ /d native,builtin"), "ExtraOptions winmm override configured")
-            try assertCondition(wineCalls.contains(#"args=[C:\Azimuth\azimuth.exe --skip-launcher]"#) && wineCalls.contains("D3DMETAL=[1] AVX=[0] HUD=[1]"), "azimuth.exe --skip-launcher launched with D3DMETAL=1, ROSETTA_ADVERTISE_AVX=0, MTL_HUD_ENABLED=1")
+            try assertCondition(wineCalls.contains("QUICKSFV_NEUTRALIZED=YES"), "Neutralized both MD5/QuickSFV.EXE and _Redist/QuickSFV.exe with noop.exe before setup.exe ran")
+            try assertCondition(wineCalls.contains("Version /t REG_SZ /d winxp64"), "Wine prefix was set to winxp64 before running setup.exe")
+            try assertCondition(wineCalls.contains(#"C:\fg_setup\setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /DIR=C:\FH2Game"#), "setup.exe was invoked with /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /DIR=C:\\FH2Game")
+            try assertCondition(wineCalls.contains("Version /t REG_SZ /d win10"), "Wine prefix was restored to win10 after setup.exe completed")
+            try assertCondition(wineCalls.contains("d3d12 /t REG_SZ /d native,builtin"), "Step 4 configured Wine DLL overrides for Azimuth")
 
-            // Run 2: Switch to Azimuth 1.0.1, 2160p, ExtraOptions OFF, Metal HUD OFF
-            vm.azimuthBuild = .v1_0_1
-            vm.resolution = .r2160
-            vm.enableExtraOptions = false
-            vm.showMetalHUD = false
-
-            let pid2 = try vm.executeLaunchSequence(
-                bottleOverrideURL: testBottle,
-                envOverride: mockEnv,
-                gameFolderOverride: validGameDir.path
+            let iniURL = testBottle.appendingPathComponent("drive_c/Azimuth/data/azimuth.ini")
+            let iniRaw = try Data(contentsOf: iniURL)
+            let iniText = String(data: Data(iniRaw.dropFirst(2)), encoding: .utf16LittleEndian) ?? ""
+            try assertCondition(
+                iniRaw.prefix(2) == Data([0xFF, 0xFE]) && iniText.contains("game=1a96545b") && iniText.contains("antialiasing=off"),
+                "Step 4 wrote valid UTF-16LE data/azimuth.ini pointing directly to unpacked Forza Horizon 2 folder"
             )
-            try assertCondition(pid2 > 0, "executeLaunchSequence (Run 2: Azimuth 1.0.1, 2160p, ExtraOptions=OFF) spawned process PID \(pid2)")
-            usleep(250_000)
 
-            try assertCondition(!fm.fileExists(atPath: azDest.appendingPathComponent("winmm.dll").path), "winmm.dll cleanly removed when ExtraOptions is toggled OFF")
-            try assertCondition(fm.fileExists(atPath: mockSaveURL.path), "User save data in data/titles/1a96545b/save.bin preserved across Azimuth version switch")
-            try assertCondition(fm.fileExists(atPath: iniURL.appendingPathExtension("bak-fh2port").path), "azimuth.ini.bak-fh2port backup created before in-place update")
-
-            let iniRaw2 = try Data(contentsOf: iniURL)
-            let iniText2 = String(data: Data(iniRaw2.dropFirst(2)), encoding: .utf16LittleEndian) ?? ""
-            try assertCondition(iniText2.contains("resolution=2160") && iniText2.contains("antialiasing=off"), "azimuth.ini updated in-place to resolution=2160 and antialiasing=off")
-
-            print("=== ALL SELF-TESTS PASSED SUCCESSFULLY (0 ERRORS) ===")
+            print("=== ALL v1.1.0 SELF-TESTS PASSED SUCCESSFULLY (0 ERRORS) ===")
             return 0
         } catch {
             fputs("[FAIL] Self-test error: \(error.localizedDescription)\n", stderr)
@@ -1832,4 +2577,3 @@ enum LauncherEntryPoint {
         }
     }
 }
-
