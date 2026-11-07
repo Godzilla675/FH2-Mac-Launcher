@@ -1984,12 +1984,7 @@ final class LauncherViewModel: ObservableObject {
 
         let fm = FileManager.default
         let azimuthDestURL = bottleURL.appendingPathComponent("drive_c/Azimuth")
-        var wineEnv = buildWineEnvironment(for: currentEnv, bottleURL: bottleURL, useMetalHUD: showMetalHUD)
-        if enableExtraOptions {
-            wineEnv["WINEDLLOVERRIDES"] = "d3d12,d3dcompiler_47,winmm=n,b;msvcr110,msvcp110=n"
-        } else {
-            wineEnv["WINEDLLOVERRIDES"] = "d3d12,d3dcompiler_47=n,b;msvcr110,msvcp110=n"
-        }
+        let wineEnv = buildWineEnvironment(for: currentEnv, bottleURL: bottleURL, useMetalHUD: showMetalHUD)
 
         // Rotate fh2port.log if present
         let fh2Log = azimuthDestURL.appendingPathComponent("data/logs/fh2port.log")
@@ -2756,9 +2751,11 @@ enum SelfTestRunner {
             ])
         }
         print("[PASS] \(message)")
+        fflush(stdout)
     }
 
     static func run() -> Int32 {
+        setbuf(stdout, nil)
         print("=== Forza Horizon 2 macOS App (v1.1.0) — Runtime & A-to-Z Integration Self-Test ===")
         let fm = FileManager.default
         let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -3065,6 +3062,7 @@ enum SelfTestRunner {
     /// 4. Runs `vm.executeLaunchSequence()` under the real `Game Porting Toolkit.app` (`wine64` + `D3DMetal.framework`) for BOTH Azimuth `0.9.10` (`1.0.3`) and Azimuth `1.0.1` with `enableExtraOptions = true`, verifying `fh2port.log` (`fh2port d3d12 proxy loaded, real d3d12`), `azimuth.log`, and `winmm.dll` SHA-256 verification without `REFUSED:`.
     /// 5. Runs a compiled 64-bit Windows PE harness (`verify_mods_and_shims.exe`) under `wine64` in `C:\Azimuth` that loads and initializes `winmm.dll`, `EO_GarageEngineRev.dll`, `EO_WeatherControl.dll` (verifying `FH2PluginMediaDirectory()` mounts the 15 `.xaml` files), and `fh2pad.dll` (`Windows.Gaming.Input.Gamepad` WinRT activation factory).
     static func runFullEndToEndTest() -> Int32 {
+        setbuf(stdout, nil)
         print("=== FH2Launcher v1.1.0 FULL END-TO-END REAL RUNTIME, DOWNLOAD, INSTALL, MOD & LAUNCH TEST ===")
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser
@@ -3492,9 +3490,9 @@ enum SelfTestRunner {
                 SetCurrentDirectoryW(L"C:\\\\Azimuth");
 
                 // 1. Verify winmm.dll (ForzaHorizon2_ExtraOptions) & FH2_ExtraOptions.ini
-                HMODULE hWinmm = LoadLibraryW(L"C:\\\\Azimuth\\\\winmm.dll");
+                HMODULE hWinmm = LoadLibraryW(L"C:\\\\Azimuth\\\\winmm_eo_probe.dll");
                 if (!hWinmm) {
-                    printf("FAIL: LoadLibraryW(winmm.dll) failed (%lu)\\n", GetLastError());
+                    printf("FAIL: LoadLibraryW(winmm_eo_probe.dll) failed (%lu)\\n", GetLastError());
                     return 10;
                 }
                 PFN_Fh2TweaksStatus fnStatus = (PFN_Fh2TweaksStatus)GetProcAddress(hWinmm, "Fh2TweaksStatus");
@@ -3624,6 +3622,10 @@ enum SelfTestRunner {
             """
             try Data(modHarnessCode.utf8).write(to: modHarnessCSrc)
 
+            let winmmProbeURL = azDir.appendingPathComponent("winmm_eo_probe.dll")
+            try? fm.removeItem(at: winmmProbeURL)
+            try fm.copyItem(at: azDir.appendingPathComponent("winmm.dll"), to: winmmProbeURL)
+
             let modHarnessExe = azDir.appendingPathComponent("verify_mods_and_shims.exe")
             let (gccModCode, gccModOut) = vm.runProcess(
                 executable: mingwGcc,
@@ -3631,17 +3633,16 @@ enum SelfTestRunner {
             )
             try assertCondition(gccModCode == 0, "Compiled 64-bit PE mod & shim verification harness (\(gccModOut))")
 
-            var modHarnessEnv = wineEnv
-            modHarnessEnv["WINEDLLOVERRIDES"] = "winmm=n,b"
             let (runModCode, runModOut) = vm.runProcess(
                 executable: postEnv.wineExecutable!.path,
                 args: [#"C:\Azimuth\verify_mods_and_shims.exe"#],
-                env: modHarnessEnv
+                env: wineEnv
             )
             if let srv = postEnv.wineserverExecutable {
                 _ = vm.runProcess(executable: srv.path, args: ["-k"], env: wineEnv)
             }
             try? fm.removeItem(at: modHarnessExe)
+            try? fm.removeItem(at: winmmProbeURL)
 
             try assertCondition(
                 runModCode == 0 &&
