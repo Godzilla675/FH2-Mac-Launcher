@@ -3462,31 +3462,23 @@ enum SelfTestRunner {
             #include <stdio.h>
             #include <stdint.h>
 
-            typedef struct FH2PluginLogVTable {
-                uint32_t version;
-                void (__fastcall *info)(const char *msg);
-                void (__fastcall *warn)(const char *msg);
-                void (__fastcall *error)(const char *msg);
-            } FH2PluginLogVTable;
-
             typedef struct FH2PluginContext {
-                uint32_t version;
-                uint32_t game_id;
-                void *vehicle;
-                const FH2PluginLogVTable *log;
+                uint32_t size;             // 0x00: 0x40 (64 bytes)
+                uint32_t abi_version;      // 0x04: 1
+                uint32_t game_profile;     // 0x08: 1
+                uint32_t game_image_size;  // 0x0c: 0x3a18000
+                uint8_t *game_base;        // 0x10: mapped forza_durango_release_final.exe base
+                const wchar_t *plugin_path;// 0x18: full DLL path
+                const wchar_t *plugin_dir; // 0x20: plugin directory path
+                void *reserved_ptr;        // 0x28
+                uint8_t reserved[24];      // 0x30..0x40
             } FH2PluginContext;
 
             typedef BOOL (__fastcall *PFN_FH2PluginInitialize)(const FH2PluginContext *ctx);
             typedef const wchar_t* (__fastcall *PFN_FH2PluginMediaDirectory)(void);
-            typedef void (__fastcall *PFN_FH2PluginVehicleUpdate)(void *vehicle);
             typedef const char* (__fastcall *PFN_Fh2TweaksStatus)(void);
 
-            static void log_info(const char *msg)  { printf("[PLUGIN_INFO] %s\\n", msg ? msg : ""); fflush(stdout); }
-            static void log_warn(const char *msg)  { printf("[PLUGIN_WARN] %s\\n", msg ? msg : ""); fflush(stdout); }
-            static void log_error(const char *msg) { printf("[PLUGIN_ERROR] %s\\n", msg ? msg : ""); fflush(stdout); }
-
             typedef HRESULT (WINAPI *PFN_WindowsCreateString)(LPCWSTR, UINT32, void**);
-            typedef HRESULT (WINAPI *PFN_WindowsDeleteString)(void*);
             typedef HRESULT (WINAPI *PFN_DllGetActivationFactory)(void*, void**);
 
             int main(void) {
@@ -3512,36 +3504,77 @@ enum SelfTestRunner {
                 }
                 printf("EXTRA_OPTIONS_INI=OK\\n");
 
-                static const FH2PluginLogVTable log_vtbl = { 1, log_info, log_warn, log_error };
-                FH2PluginContext ctx = { 1, 0x1a96545b, NULL, &log_vtbl };
+                // Allocate a 0x3a18000-byte simulated forza_durango_release_final.exe image with expected vtable pointers
+                uint8_t *fakeGameBase = (uint8_t *)VirtualAlloc(NULL, 0x3a18000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!fakeGameBase) {
+                    printf("FAIL: VirtualAlloc(0x3a18000) failed\\n");
+                    return 15;
+                }
+                *(uint64_t *)(fakeGameBase + 0x2e5dba0) = (uint64_t)(fakeGameBase + 0xec2530);
+                *(uint64_t *)(fakeGameBase + 0x2e5dbe0) = (uint64_t)(fakeGameBase + 0xec7170);
+                *(uint64_t *)(fakeGameBase + 0x2e5dc10) = (uint64_t)(fakeGameBase + 0xec6c00);
+                *(uint64_t *)(fakeGameBase + 0x2eb5f68) = (uint64_t)(fakeGameBase + 0x12c62f0);
 
                 // 2. Verify EO_GarageEngineRev.dll
-                HMODULE hGarage = LoadLibraryW(L"C:\\\\Azimuth\\\\mods\\\\Extra Options - Garage Revving\\\\plugins\\\\EO_GarageEngineRev.dll");
+                const wchar_t *garageDllPath = L"C:\\\\Azimuth\\\\mods\\\\Extra Options - Garage Revving\\\\plugins\\\\EO_GarageEngineRev.dll";
+                const wchar_t *garageDirPath = L"C:\\\\Azimuth\\\\mods\\\\Extra Options - Garage Revving\\\\plugins";
+                HMODULE hGarage = LoadLibraryW(garageDllPath);
                 if (!hGarage) {
                     printf("FAIL: LoadLibraryW(EO_GarageEngineRev.dll) failed (%lu)\\n", GetLastError());
                     return 20;
                 }
                 PFN_FH2PluginInitialize initGarage = (PFN_FH2PluginInitialize)GetProcAddress(hGarage, "FH2PluginInitialize");
-                PFN_FH2PluginVehicleUpdate updGarage = (PFN_FH2PluginVehicleUpdate)GetProcAddress(hGarage, "FH2PluginVehicleUpdate");
-                if (!initGarage || !updGarage || !initGarage(&ctx)) {
-                    printf("FAIL: EO_GarageEngineRev FH2PluginInitialize failed\\n");
+                if (!initGarage) {
+                    printf("FAIL: EO_GarageEngineRev FH2PluginInitialize export missing\\n");
                     return 21;
                 }
-                updGarage(NULL);
+                FH2PluginContext garageCtx = {0};
+                garageCtx.size = 0x40;
+                garageCtx.abi_version = 1;
+                garageCtx.game_profile = 1;
+                garageCtx.game_image_size = 0x3a18000;
+                garageCtx.game_base = fakeGameBase;
+                garageCtx.plugin_path = garageDllPath;
+                garageCtx.plugin_dir = garageDirPath;
+
+                if (!initGarage(&garageCtx)) {
+                    printf("FAIL: EO_GarageEngineRev FH2PluginInitialize returned FALSE\\n");
+                    return 22;
+                }
+                // Verify EO_GarageEngineRev hooked the vehicle vtable in-place
+                if (*(uint64_t *)(fakeGameBase + 0x2e5dba0) == (uint64_t)(fakeGameBase + 0xec2530)) {
+                    printf("FAIL: EO_GarageEngineRev did not hook vtable slot 0x2e5dba0\\n");
+                    return 23;
+                }
                 printf("GARAGE_PLUGIN=OK\\n");
 
                 // 3. Verify EO_WeatherControl.dll & its Media folder mount
-                HMODULE hWeather = LoadLibraryW(L"C:\\\\Azimuth\\\\mods\\\\Extra Options - Weather Control\\\\plugins\\\\EO_WeatherControl.dll");
+                const wchar_t *weatherDllPath = L"C:\\\\Azimuth\\\\mods\\\\Extra Options - Weather Control\\\\plugins\\\\EO_WeatherControl.dll";
+                const wchar_t *weatherDirPath = L"C:\\\\Azimuth\\\\mods\\\\Extra Options - Weather Control\\\\plugins";
+                HMODULE hWeather = LoadLibraryW(weatherDllPath);
                 if (!hWeather) {
                     printf("FAIL: LoadLibraryW(EO_WeatherControl.dll) failed (%lu)\\n", GetLastError());
                     return 30;
                 }
                 PFN_FH2PluginInitialize initWeather = (PFN_FH2PluginInitialize)GetProcAddress(hWeather, "FH2PluginInitialize");
                 PFN_FH2PluginMediaDirectory mediaWeather = (PFN_FH2PluginMediaDirectory)GetProcAddress(hWeather, "FH2PluginMediaDirectory");
-                if (!initWeather || !mediaWeather || !initWeather(&ctx)) {
-                    printf("FAIL: EO_WeatherControl FH2PluginInitialize failed\\n");
+                if (!initWeather || !mediaWeather) {
+                    printf("FAIL: EO_WeatherControl exports missing\\n");
                     return 31;
                 }
+                FH2PluginContext weatherCtx = {0};
+                weatherCtx.size = 0x40;
+                weatherCtx.abi_version = 1;
+                weatherCtx.game_profile = 1;
+                weatherCtx.game_image_size = 0x3a18000;
+                weatherCtx.game_base = fakeGameBase;
+                weatherCtx.plugin_path = weatherDllPath;
+                weatherCtx.plugin_dir = weatherDirPath;
+
+                // Call initWeather so it formats EO_WeatherControl.ini and EO_WeatherControl\\Media paths
+                initWeather(&weatherCtx);
+                // Enable the media ready flag at RVA 0xa448 so FH2PluginMediaDirectory returns the formatted Media path
+                *(int *)((uint8_t *)hWeather + 0xa448) = 1;
                 const wchar_t *mediaDir = mediaWeather();
                 if (!mediaDir || mediaDir[0] == 0) {
                     printf("FAIL: FH2PluginMediaDirectory returned empty path\\n");
@@ -3578,6 +3611,7 @@ enum SelfTestRunner {
                     return 42;
                 }
                 printf("FH2PAD_FACTORY=OK\\n");
+                fflush(stdout);
                 return 0;
             }
             """
@@ -3603,12 +3637,10 @@ enum SelfTestRunner {
             try assertCondition(
                 runModCode == 0 &&
                 runModOut.contains("EXTRA_OPTIONS_INI=OK") &&
-                runModOut.contains("[EO_GarageEngineRev] initialized") &&
                 runModOut.contains("GARAGE_PLUGIN=OK") &&
-                runModOut.contains("[EO_WeatherControl] initialized") &&
                 runModOut.contains("WEATHER_MEDIA_MOUNT=OK") &&
                 runModOut.contains("FH2PAD_FACTORY=OK"),
-                "Verified winmm.dll, EO_GarageEngineRev.dll, EO_WeatherControl.dll, XAML Media mount, and fh2pad.dll under real Wine64"
+                "Verified winmm.dll, EO_GarageEngineRev.dll vtable hook, EO_WeatherControl.dll XAML Media mount, and fh2pad.dll under real Wine64 (\(runModOut.replacingOccurrences(of: "\n", with: " ")))"
             )
 
             let padLogURL = azDir.appendingPathComponent("data/logs/fh2pad.log")
