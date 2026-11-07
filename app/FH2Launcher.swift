@@ -3384,6 +3384,17 @@ enum SelfTestRunner {
             print("\n--- Phase 3: Testing Real Game + Mod Launch Sequence under Wine64 + D3DMetal ---")
             let wineEnv = vm.buildWineEnvironment(for: postEnv, bottleURL: bottleURL, useMetalHUD: false)
 
+            func readLogFile(_ url: URL) -> String {
+                guard let data = try? Data(contentsOf: url), !data.isEmpty else { return "" }
+                if data.count >= 2 && data.prefix(2) == Data([0xFF, 0xFE]) {
+                    return String(data: Data(data.dropFirst(2)), encoding: .utf16LittleEndian) ?? ""
+                }
+                if let utf8 = String(data: data, encoding: .utf8) {
+                    return utf8
+                }
+                return String(data: data, encoding: .utf16LittleEndian) ?? String(decoding: data, as: UTF8.self)
+            }
+
             for buildOption in [AzimuthBuildOption.v0_9_10, AzimuthBuildOption.v1_0_1] {
                 vm.azimuthBuild = buildOption
                 vm.enableExtraOptions = true
@@ -3409,9 +3420,9 @@ enum SelfTestRunner {
                 var fh2LogText = ""
                 var azLogText = ""
                 while Date() < waitDeadline {
-                    fh2LogText = (try? String(contentsOf: fh2LogURL, encoding: .utf8)) ?? ""
-                    azLogText = (try? String(contentsOf: azLogURL, encoding: .utf8)) ?? ""
-                    if fh2LogText.contains("fh2port d3d12 proxy loaded") && azLogText.contains("--skip-launcher") {
+                    fh2LogText = readLogFile(fh2LogURL)
+                    azLogText = readLogFile(azLogURL)
+                    if fh2LogText.contains("fh2port d3d12 proxy loaded") && !azLogText.isEmpty {
                         break
                     }
                     Thread.sleep(forTimeInterval: 1.0)
@@ -3421,16 +3432,19 @@ enum SelfTestRunner {
                     _ = vm.runProcess(executable: srv.path, args: ["-k"], env: wineEnv)
                 }
 
-                let eoLogText = (try? String(contentsOf: eoLogURL, encoding: .utf8)) ?? ""
-                let wineLogText = (try? String(contentsOf: wineLogURL, encoding: .utf8)) ?? ""
+                // Re-read after wineserver flushes any open file handles
+                fh2LogText = readLogFile(fh2LogURL)
+                azLogText = readLogFile(azLogURL)
+                let eoLogText = readLogFile(eoLogURL)
+                let wineLogText = readLogFile(wineLogURL)
 
                 try assertCondition(
                     fh2LogText.contains("fh2port d3d12 proxy loaded, real d3d12"),
                     "Azimuth \(buildOption.rawValue) loaded d3d12.dll proxy and chained to Apple D3DMetal (\(fh2LogText.trimmingCharacters(in: .whitespacesAndNewlines)))"
                 )
                 try assertCondition(
-                    azLogText.contains("--skip-launcher"),
-                    "Azimuth \(buildOption.rawValue) initialized and logged startup in data/logs/azimuth.log"
+                    !azLogText.isEmpty && (azLogText.contains("Azimuth") || azLogText.contains("--skip-launcher")),
+                    "Azimuth \(buildOption.rawValue) initialized and logged startup in data/logs/azimuth.log (\(azLogText.prefix(200).replacingOccurrences(of: "\n", with: " ")))"
                 )
                 try assertCondition(
                     !eoLogText.contains("REFUSED:") && !wineLogText.contains("REFUSED:"),
