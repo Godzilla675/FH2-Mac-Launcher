@@ -12,6 +12,6 @@
     "name": "Game Porting Toolkit (Wine64 + Apple D3DMetal)",
     "github_releases_api": "https://api.github.com/repos/Gcenx/game-porting-toolkit/releases/latest",
     "fallback_download_url": "https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-3.0-3/game-porting-toolkit-3.0-3.tar.xz",
-    "expected_size_bytes": 515000000
+    "expected_size_bytes": 239200808
   }
 }

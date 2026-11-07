@@ -60,13 +60,19 @@ jobs:
           wait "$GUI_PID" 2>/dev/null || true
           cat "$HOME/Library/Logs/FH2Port/launcher.log"
 
-          echo "=== 3. Mounting DMG and Verifying Signed App Inside Mounted Volume ==="
+          echo "=== 3. Mounting DMG, Installing App to /Applications, and Verifying Signature ==="
           MOUNT_DIR="/Volumes/Forza Horizon 2"
           hdiutil attach "dist/Forza-Horizon-2-Mac-Installer.dmg" -mountpoint "$MOUNT_DIR" -nobrowse -readonly
           ls -la "$MOUNT_DIR"
           test -L "$MOUNT_DIR/Applications"
           codesign --verify --deep --strict "$MOUNT_DIR/Forza Horizon 2.app"
+          rm -rf "/Applications/Forza Horizon 2.app"
+          ditto "$MOUNT_DIR/Forza Horizon 2.app" "/Applications/Forza Horizon 2.app"
           hdiutil detach "$MOUNT_DIR"
+          codesign --verify --deep --strict "/Applications/Forza Horizon 2.app"
+
+          echo "=== 4. Running Full End-to-End Real GPTK Download, Google Drive Auto-Resume, Wine64 Unpack, Mod & Game Launch Test ==="
+          "/Applications/Forza Horizon 2.app/Contents/MacOS/FH2Launcher" --e2e-full-test
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

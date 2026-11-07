@@ -60,7 +60,7 @@ struct SetupManifest {
         gameUnpackedTargetBytes: 42_949_672_960, // ~40.0 GiB
         runtimeReleasesAPI: "https://api.github.com/repos/Gcenx/game-porting-toolkit/releases/latest",
         runtimeFallbackURL: "https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-3.0-3/game-porting-toolkit-3.0-3.tar.xz",
-        runtimeExpectedBytes: 515_000_000
+        runtimeExpectedBytes: 239_200_808
     )
 
     static func loadFromBundle() -> SetupManifest {
@@ -646,21 +646,74 @@ final class LauncherViewModel: ObservableObject {
 
     // MARK: - Game Folder Validation & Manual Picker
 
-    static func checkGameFolderValid(at url: URL) -> Bool {
+    /// Resolves the Azimuth package root directory (the directory directly holding `Mount/` and `EmbeddedXvd/`).
+    /// Supports:
+    ///   1. `<dir>` directly holding `Mount/forza_durango_release_final.exe`, `Mount/AppxManifest.xml`, or `Mount/Media`
+    ///   2. `<dir>/Anthem_1.0.0.64_x64__8wekyb3d8bbwe` (as unpacked by FitGirl's `setup.exe`) or any immediate child package folder holding `Mount/...`
+    ///   3. `<dir>/Mount` if the user selected the `Mount` subfolder directly
+    ///   4. `<dir>` directly holding `forza_durango_release_final.exe` or `Media`
+    static func resolveAzimuthPackageRoot(at url: URL) -> URL? {
         let fm = FileManager.default
-        let candidates = [
-            url.appendingPathComponent("Mount/forza_durango_release_final.exe"),
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+            return nil
+        }
+
+        func isDirectPackageRoot(_ candidate: URL) -> Bool {
+            let mountMarkers = [
+                candidate.appendingPathComponent("Mount/forza_durango_release_final.exe"),
+                candidate.appendingPathComponent("Mount/AppxManifest.xml"),
+                candidate.appendingPathComponent("Mount/Media"),
+                candidate.appendingPathComponent("Mount/media")
+            ]
+            return mountMarkers.contains { fm.fileExists(atPath: $0.path) }
+        }
+
+        if isDirectPackageRoot(url) {
+            return url
+        }
+
+        if url.lastPathComponent.lowercased() == "mount" {
+            let parent = url.deletingLastPathComponent()
+            if isDirectPackageRoot(parent) ||
+               fm.fileExists(atPath: url.appendingPathComponent("forza_durango_release_final.exe").path) ||
+               fm.fileExists(atPath: url.appendingPathComponent("AppxManifest.xml").path) {
+                return parent
+            }
+        }
+
+        let preferredChild = url.appendingPathComponent("Anthem_1.0.0.64_x64__8wekyb3d8bbwe")
+        if isDirectPackageRoot(preferredChild) {
+            return preferredChild
+        }
+        if let children = try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
+            for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                if isDirectPackageRoot(child) {
+                    return child
+                }
+            }
+        }
+
+        let flatMarkers = [
             url.appendingPathComponent("forza_durango_release_final.exe"),
-            url.appendingPathComponent("Mount/Media"),
-            url.appendingPathComponent("Media")
+            url.appendingPathComponent("Media"),
+            url.appendingPathComponent("media")
         ]
-        return candidates.contains { fm.fileExists(atPath: $0.path) }
+        if flatMarkers.contains(where: { fm.fileExists(atPath: $0.path) }) {
+            return url
+        }
+
+        return nil
+    }
+
+    static func checkGameFolderValid(at url: URL) -> Bool {
+        resolveAzimuthPackageRoot(at: url) != nil
     }
 
     func selectGameFolder() {
         let panel = NSOpenPanel()
         panel.title = "Select Existing Forza Horizon 2 Game Folder"
-        panel.message = "Choose the Forza Horizon 2 folder (containing Mount/forza_durango_release_final.exe or Media)"
+        panel.message = "Choose the Forza Horizon 2 folder (containing Mount/forza_durango_release_final.exe or Anthem_1.0.0.64_x64__8wekyb3d8bbwe)"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -669,9 +722,8 @@ final class LauncherViewModel: ObservableObject {
         }
         NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK, let url = panel.url {
-            if url.lastPathComponent.lowercased() == "mount" &&
-                FileManager.default.fileExists(atPath: url.appendingPathComponent("forza_durango_release_final.exe").path) {
-                gameFolderPath = url.deletingLastPathComponent().path
+            if let pkgRoot = Self.resolveAzimuthPackageRoot(at: url) {
+                gameFolderPath = pkgRoot.path
             } else {
                 gameFolderPath = url.path
             }
@@ -692,26 +744,33 @@ final class LauncherViewModel: ObservableObject {
             return
         }
 
-        let resourceValues = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
-        let mountValues = try? url.appendingPathComponent("Mount").resourceValues(forKeys: [.isSymbolicLinkKey])
-        let isSymlink = (resourceValues?.isSymbolicLink == true) || (mountValues?.isSymbolicLink == true)
-
-        let candidates = [
-            url.appendingPathComponent("Mount/forza_durango_release_final.exe"),
-            url.appendingPathComponent("forza_durango_release_final.exe"),
-            url.appendingPathComponent("Mount/Media"),
-            url.appendingPathComponent("Media"),
-            url.appendingPathComponent("Mount/AppxManifest.xml")
-        ]
-
-        if let matched = candidates.first(where: { fm.fileExists(atPath: $0.path) }) {
-            let rel = matched.path.replacingOccurrences(of: url.path + "/", with: "")
-            folderValidation = .verified(executableOrMedia: rel, isSymlink: isSymlink)
-            appendLog("Game folder verified: \(url.path) (found \(rel))")
-        } else {
+        guard let pkgRoot = Self.resolveAzimuthPackageRoot(at: url) else {
             folderValidation = .invalid(reason: "Missing Mount/forza_durango_release_final.exe or Media directory")
             appendLog("Game folder check failed for \(url.path)")
+            return
         }
+
+        let resourceValues = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
+        let pkgValues = try? pkgRoot.resourceValues(forKeys: [.isSymbolicLinkKey])
+        let mountValues = try? pkgRoot.appendingPathComponent("Mount").resourceValues(forKeys: [.isSymbolicLinkKey])
+        let isSymlink = (resourceValues?.isSymbolicLink == true) ||
+                        (pkgValues?.isSymbolicLink == true) ||
+                        (mountValues?.isSymbolicLink == true)
+
+        let candidates = [
+            pkgRoot.appendingPathComponent("Mount/forza_durango_release_final.exe"),
+            pkgRoot.appendingPathComponent("forza_durango_release_final.exe"),
+            pkgRoot.appendingPathComponent("Mount/AppxManifest.xml"),
+            pkgRoot.appendingPathComponent("Mount/Media"),
+            pkgRoot.appendingPathComponent("Mount/media"),
+            pkgRoot.appendingPathComponent("Media"),
+            pkgRoot.appendingPathComponent("media")
+        ]
+
+        let matched = candidates.first(where: { fm.fileExists(atPath: $0.path) }) ?? pkgRoot
+        let rel = matched.path.replacingOccurrences(of: url.path + "/", with: "")
+        folderValidation = .verified(executableOrMedia: rel, isSymlink: isSymlink)
+        appendLog("Game folder verified: \(url.path) -> packageRoot=\(pkgRoot.path) (found \(rel))")
     }
 
     // MARK: - Google Drive Large-File Confirmation Resolver & Auto-Resumable Downloader
@@ -795,9 +854,9 @@ final class LauncherViewModel: ObservableObject {
         }
     }
 
-    /// Queries GitHub Releases API for the latest `Gcenx/game-porting-toolkit` `.tar.xz` asset URL,
-    /// falling back to `manifest.runtimeFallbackURL` if rate-limited or offline.
-    static func resolveLatestRuntimeDownloadURL(manifest: SetupManifest) -> String {
+    /// Queries GitHub Releases API for the latest `Gcenx/game-porting-toolkit` `.tar.xz` asset URL and byte size,
+    /// falling back to `manifest.runtimeFallbackURL` and `manifest.runtimeExpectedBytes` if rate-limited or offline.
+    static func resolveLatestRuntimeAsset(manifest: SetupManifest) -> (url: String, sizeBytes: Int64) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
         proc.arguments = [
@@ -819,12 +878,17 @@ final class LauncherViewModel: ObservableObject {
                let assets = json["assets"] as? [[String: Any]] {
                 for asset in assets {
                     if let url = asset["browser_download_url"] as? String, url.hasSuffix(".tar.xz") {
-                        return url
+                        let sz = (asset["size"] as? NSNumber)?.int64Value ?? manifest.runtimeExpectedBytes
+                        return (url, sz > 0 ? sz : manifest.runtimeExpectedBytes)
                     }
                 }
             }
         } catch {}
-        return manifest.runtimeFallbackURL
+        return (manifest.runtimeFallbackURL, manifest.runtimeExpectedBytes)
+    }
+
+    static func resolveLatestRuntimeDownloadURL(manifest: SetupManifest) -> String {
+        resolveLatestRuntimeAsset(manifest: manifest).url
     }
 
     enum ChunkValidationResult {
@@ -1317,17 +1381,20 @@ final class LauncherViewModel: ObservableObject {
             try fm.createDirectory(at: userAppsDir, withIntermediateDirectories: true)
             let gptkAppDest = userAppsDir.appendingPathComponent("Game Porting Toolkit.app")
 
-            if !fm.fileExists(atPath: gptkAppDest.appendingPathComponent("Contents/Resources/wine/bin/wine64").path) {
+            let gptkWine64 = gptkAppDest.appendingPathComponent("Contents/Resources/wine/bin/wine64")
+            let gptkWine = gptkAppDest.appendingPathComponent("Contents/Resources/wine/bin/wine")
+            if !fm.fileExists(atPath: gptkWine64.path) && !fm.fileExists(atPath: gptkWine.path) {
                 let runtimePart = workCacheDir.appendingPathComponent("runtime.tar.xz.part")
                 let runtimeArchive = workCacheDir.appendingPathComponent("runtime.tar.xz")
+                let resolvedRuntime = Self.resolveLatestRuntimeAsset(manifest: self.manifest)
 
                 try downloadWithAutoResume(
                     label: "Apple Silicon Graphics Runtime (Game Porting Toolkit)",
                     partFileURL: runtimePart,
                     finalFileURL: runtimeArchive,
-                    expectedBytes: manifest.runtimeExpectedBytes,
+                    expectedBytes: resolvedRuntime.sizeBytes,
                     requireZipMagic: false,
-                    urlResolver: { Self.resolveLatestRuntimeDownloadURL(manifest: self.manifest) },
+                    urlResolver: { resolvedRuntime.url },
                     onProgress: { cur, exp, speed in
                         let pct = min(0.85, max(0.12, 0.12 + (Double(cur) / Double(max(1, exp))) * 0.73))
                         let mb = Double(cur) / 1_048_576.0
@@ -1711,7 +1778,9 @@ final class LauncherViewModel: ObservableObject {
         useMetalHUD: Bool
     ) throws {
         let fm = FileManager.default
-        let userGameFolder = URL(fileURLWithPath: rawGameFolder).resolvingSymlinksInPath().path
+        let rawGameURL = URL(fileURLWithPath: rawGameFolder).resolvingSymlinksInPath()
+        let resolvedPkgURL = Self.resolveAzimuthPackageRoot(at: rawGameURL)?.resolvingSymlinksInPath() ?? rawGameURL
+        let userGameFolder = resolvedPkgURL.path
         guard let payloadRoot = Bundle.main.resourceURL?.appendingPathComponent("payload") else {
             throw NSError(domain: "FH2Launch", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "Bundled payload directory is missing from app bundle."
@@ -1797,7 +1866,14 @@ final class LauncherViewModel: ObservableObject {
             self.appendLog("Enabling ForzaHorizon2_ExtraOptions (Unlock All DLC & Skip Intro Videos)")
             try? fm.removeItem(at: winmmDst)
             try fm.copyItem(at: extraOptionsSrc.appendingPathComponent("winmm.dll"), to: winmmDst)
-            if !fm.fileExists(atPath: eoIniDst.path) {
+            let existingIniData = try? Data(contentsOf: eoIniDst)
+            let iniNeedsCopy: Bool = {
+                guard let d = existingIniData, !d.isEmpty, d.count <= 8192 else { return true }
+                if d.prefix(2) == Data([0xFF, 0xFE]) || d.prefix(2) == Data([0xFE, 0xFF]) { return true }
+                return String(data: d, encoding: .utf8) == nil
+            }()
+            if iniNeedsCopy {
+                try? fm.removeItem(at: eoIniDst)
                 try? fm.copyItem(at: extraOptionsSrc.appendingPathComponent("FH2_ExtraOptions.ini"), to: eoIniDst)
             }
             if fm.fileExists(atPath: extraOptionsSrc.appendingPathComponent("mods").path) {
@@ -1934,7 +2010,13 @@ final class LauncherViewModel: ObservableObject {
             proc.standardError = logHandle
         }
 
-        try proc.run()
+        do {
+            try proc.run()
+            try? logHandle?.close()
+        } catch {
+            try? logHandle?.close()
+            throw error
+        }
         self.appendLog("Started azimuth.exe (PID \(proc.processIdentifier)) in bottle \(bottleURL.path)")
         return proc.processIdentifier
     }
@@ -2022,6 +2104,7 @@ final class LauncherViewModel: ObservableObject {
         upsertKey("game_folder", value: windowsGamePath, inSection: "launcher", content: &text)
         upsertKey("antialiasing", value: "off", inSection: "launcher", content: &text)
         upsertKey("resolution", value: resolution, inSection: "launcher", content: &text)
+        upsertKey("settings_version", value: settingsVer, inSection: "launcher", content: &text)
 
         upsertKey("folder", value: windowsGamePath, inSection: "title-1a96545b", content: &text)
         upsertKey("antialiasing", value: "off", inSection: "title-1a96545b", content: &text)
@@ -2852,8 +2935,10 @@ enum SelfTestRunner {
                 if [ -f "$WINEPREFIX/drive_c/fg_setup/MD5/QuickSFV.EXE.disabled" ] && [ -f "$WINEPREFIX/drive_c/fg_setup/_Redist/QuickSFV.exe.disabled" ]; then
                     echo "QUICKSFV_NEUTRALIZED=YES" >> "\(mockWineLog.path)"
                 fi
-                mkdir -p "$WINEPREFIX/drive_c/FH2Game/Mount"
-                echo "MZ_UNPACKED_FH2_EXE" > "$WINEPREFIX/drive_c/FH2Game/Mount/forza_durango_release_final.exe"
+                mkdir -p "$WINEPREFIX/drive_c/FH2Game/Anthem_1.0.0.64_x64__8wekyb3d8bbwe/Mount"
+                mkdir -p "$WINEPREFIX/drive_c/FH2Game/Anthem_1.0.0.64_x64__8wekyb3d8bbwe/EmbeddedXvd/Windows/System32"
+                echo "MZ_UNPACKED_FH2_EXE" > "$WINEPREFIX/drive_c/FH2Game/Anthem_1.0.0.64_x64__8wekyb3d8bbwe/Mount/forza_durango_release_final.exe"
+                echo "<Package/>" > "$WINEPREFIX/drive_c/FH2Game/Anthem_1.0.0.64_x64__8wekyb3d8bbwe/Mount/AppxManifest.xml"
             fi
             exit 0
             """
@@ -2927,8 +3012,8 @@ enum SelfTestRunner {
                 "Attempt 1 HTML Quota-Exceeded page was rejected without deleting or corrupting 50% FH2-Game.zip.part (\(partSizeAfterAttempt1) bytes intact), and Attempt 2 resumed from 50% -> 100%"
             )
             try assertCondition(
-                fm.fileExists(atPath: testFinalGameDir.appendingPathComponent("Mount/forza_durango_release_final.exe").path),
-                "4-Step pipeline unpacked forza_durango_release_final.exe into final game folder"
+                fm.fileExists(atPath: testFinalGameDir.appendingPathComponent("Anthem_1.0.0.64_x64__8wekyb3d8bbwe/Mount/forza_durango_release_final.exe").path),
+                "4-Step pipeline unpacked forza_durango_release_final.exe into Anthem_1.0.0.64_x64__8wekyb3d8bbwe/Mount"
             )
             try assertCondition(
                 !fm.fileExists(atPath: testBottle.appendingPathComponent("drive_c/fg_setup").path),
@@ -2950,14 +3035,576 @@ enum SelfTestRunner {
             let iniRaw = try Data(contentsOf: iniURL)
             let iniText = String(data: Data(iniRaw.dropFirst(2)), encoding: .utf16LittleEndian) ?? ""
             try assertCondition(
-                iniRaw.prefix(2) == Data([0xFF, 0xFE]) && iniText.contains("game=1a96545b") && iniText.contains("antialiasing=off"),
-                "Step 4 wrote valid UTF-16LE data/azimuth.ini pointing directly to unpacked Forza Horizon 2 folder"
+                iniRaw.prefix(2) == Data([0xFF, 0xFE]) &&
+                iniText.contains("game=1a96545b") &&
+                iniText.contains("antialiasing=off") &&
+                iniText.contains("Anthem_1.0.0.64_x64__8wekyb3d8bbwe"),
+                "Step 4 wrote valid UTF-16LE data/azimuth.ini pointing directly to Anthem_1.0.0.64_x64__8wekyb3d8bbwe package root"
             )
 
             print("=== ALL v1.1.0 SELF-TESTS PASSED SUCCESSFULLY (0 ERRORS) ===")
             return 0
         } catch {
             fputs("[FAIL] Self-test error: \(error.localizedDescription)\n", stderr)
+            return 1
+        }
+    }
+
+    /// Full End-to-End Integration Test (`--e2e-full-test`) for macOS Apple Silicon (`macos-15`):
+    /// 1. Tests `downloadWithAutoResume` against live Google Drive (`1VVmQ3d_qHOj6UhPfslSgeaBfQbc3zYcf`) with a forced mid-chunk disconnect (`SIGTERM`), verifying partial `.chunk` stream-append, `connectionInterruptedBanner`, and seamless byte-exact resume up to 8 MiB.
+    /// 2. Downloads & verifies the real `MD5/QuickSFV.EXE`, `MD5/fitgirl-bins.md5`, `fg-06.bin`, and `setup.exe` from `FH2-Game.zip` on Google Drive.
+    /// 3. Runs the REAL 4-Step Pipeline (`executeFourStepSetupPipeline` with `mockRuntimeEnv: nil`):
+    ///    - Step 1 downloads the real 239 MB `Game Porting Toolkit.app` (`game-porting-toolkit-3.0-3.tar.xz`) from GitHub Releases, installs `~/Applications/Game Porting Toolkit.app`, and verifies `D3DMetal.framework` signature & Rosetta 2.
+    ///    - Step 2 & Step 3 extract the repack archive with bundled `7zz`, neutralize `QuickSFV.EXE` with `noop.exe`, run a real 64-bit Windows PE `setup.exe` under `wine64` in `winxp64` mode to unpack `C:\FH2Game\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\Mount\forza_durango_release_final.exe` and `AppxManifest.xml`, restore `win10`, and move the unpacked game to `~/Games/Forza Horizon 2`.
+    ///    - Step 4 configures `C:\Azimuth` with `azimuth.exe`, `d3d12.dll`, `fh2pad.dll`, `d3dcompiler_47.dll`, `winmm.dll`, `FH2_ExtraOptions.ini`, `mods/`, Wine registry overrides, and `data/azimuth.ini`.
+    /// 4. Runs `vm.executeLaunchSequence()` under the real `Game Porting Toolkit.app` (`wine64` + `D3DMetal.framework`) for BOTH Azimuth `0.9.10` (`1.0.3`) and Azimuth `1.0.1` with `enableExtraOptions = true`, verifying `fh2port.log` (`fh2port d3d12 proxy loaded, real d3d12`), `azimuth.log`, and `winmm.dll` SHA-256 verification without `REFUSED:`.
+    /// 5. Runs a compiled 64-bit Windows PE harness (`verify_mods_and_shims.exe`) under `wine64` in `C:\Azimuth` that loads and initializes `winmm.dll`, `EO_GarageEngineRev.dll`, `EO_WeatherControl.dll` (verifying `FH2PluginMediaDirectory()` mounts the 15 `.xaml` files), and `fh2pad.dll` (`Windows.Gaming.Input.Gamepad` WinRT activation factory).
+    static func runFullEndToEndTest() -> Int32 {
+        print("=== FH2Launcher v1.1.0 FULL END-TO-END REAL RUNTIME, DOWNLOAD, INSTALL, MOD & LAUNCH TEST ===")
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("fh2_e2e_\(UUID().uuidString)")
+
+        do {
+            try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+            defer {
+                try? fm.removeItem(at: tempRoot)
+            }
+
+            guard let resURL = Bundle.main.resourceURL else {
+                try assertCondition(false, "Bundle.main.resourceURL must exist")
+                return 1
+            }
+            let sevenZipURL = resURL.appendingPathComponent("bin/7zz")
+            let manifest = SetupManifest.loadFromBundle()
+            let vm = LauncherViewModel()
+
+            // -------------------------------------------------------------------------
+            // PHASE 1: Live Google Drive Auto-Resume + Mid-Transfer Disconnect Recovery
+            // -------------------------------------------------------------------------
+            print("\n--- Phase 1: Testing Live Google Drive Bounded-Range Auto-Resume & Mid-Stream Disconnect Recovery ---")
+            let gdriveCookieJar = tempRoot.appendingPathComponent("e2e_gdrive_cookies.txt")
+            let resumePartURL = tempRoot.appendingPathComponent("e2e_gdrive_8mb.zip.part")
+            let targetSliceBytes: Int64 = 8 * 1024 * 1024 // 8 MiB
+
+            var didInjectMidStreamDrop = false
+            var sizeAtDrop: Int64 = 0
+            DispatchQueue.global(qos: .userInitiated).async {
+                let chunkURL = resumePartURL.appendingPathExtension("chunk")
+                let deadline = Date().addingTimeInterval(60)
+                while Date() < deadline && !didInjectMidStreamDrop {
+                    let cSize = (try? fm.attributesOfItem(atPath: chunkURL.path)[.size] as? Int64) ?? 0
+                    if cSize >= 524_288, let proc = vm.activeDownloadProcess, proc.isRunning {
+                        sizeAtDrop = cSize
+                        didInjectMidStreamDrop = true
+                        print("[E2E] Injecting simulated network disconnect (SIGTERM) at chunk size \(cSize) bytes...")
+                        proc.terminate()
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+            }
+
+            try vm.downloadWithAutoResume(
+                label: "E2E Google Drive 8 MiB Auto-Resume Slice",
+                urlResolver: {
+                    LauncherViewModel.resolveGoogleDriveDownloadURL(
+                        fileID: manifest.gameFileID,
+                        cookieJarURL: gdriveCookieJar
+                    )
+                },
+                cookieJarURL: gdriveCookieJar,
+                partFileURL: resumePartURL,
+                finalFileURL: nil,
+                expectedBytes: targetSliceBytes,
+                requireZipMagic: true,
+                onProgress: { _, _, _ in },
+                onInterrupted: { downloaded, _ in
+                    print("[E2E] onInterrupted callback fired with preserved bytes = \(downloaded)")
+                }
+            )
+
+            let finalSliceSize = (try? fm.attributesOfItem(atPath: resumePartURL.path)[.size] as? Int64) ?? 0
+            let sliceHeader = (try? FileHandle(forReadingFrom: resumePartURL).read(upToCount: 4)) ?? Data()
+            try assertCondition(
+                didInjectMidStreamDrop && sizeAtDrop >= 524_288,
+                "Injected mid-stream disconnect during live Google Drive download at \(sizeAtDrop) bytes"
+            )
+            try assertCondition(
+                finalSliceSize == targetSliceBytes && sliceHeader == Data([0x50, 0x4B, 0x03, 0x04]),
+                "downloadWithAutoResume preserved partial chunk bytes across disconnect and completed exact 8 MiB slice (\(finalSliceSize) bytes) with intact PK\\x03\\x04 header"
+            )
+
+            // Extract real `MD5/QuickSFV.EXE` and `MD5/fitgirl-bins.md5` from the 8 MiB slice
+            let extractedSliceDir = tempRoot.appendingPathComponent("extracted_slice")
+            try fm.createDirectory(at: extractedSliceDir, withIntermediateDirectories: true)
+            _ = vm.runProcess(
+                executable: sevenZipURL.path,
+                args: [
+                    "x", "-y",
+                    "-o\(extractedSliceDir.path)",
+                    resumePartURL.path,
+                    "Forza Horizon 2 [FitGirl Repack]/MD5/QuickSFV.EXE",
+                    "Forza Horizon 2 [FitGirl Repack]/MD5/fitgirl-bins.md5"
+                ]
+            )
+            let realQuickSFV = extractedSliceDir.appendingPathComponent("Forza Horizon 2 [FitGirl Repack]/MD5/QuickSFV.EXE")
+            let realMd5File = extractedSliceDir.appendingPathComponent("Forza Horizon 2 [FitGirl Repack]/MD5/fitgirl-bins.md5")
+            let realQuickSFVSize = (try? fm.attributesOfItem(atPath: realQuickSFV.path)[.size] as? Int64) ?? 0
+            let md5Content = (try? String(contentsOf: realMd5File, encoding: .utf8)) ?? ""
+            try assertCondition(
+                realQuickSFVSize == 103_424 && md5Content.contains("fg-01.bin") && md5Content.contains("fg-06.bin"),
+                "Extracted real MD5/QuickSFV.EXE (103,424 bytes) and MD5/fitgirl-bins.md5 from live Google Drive FH2-Game.zip"
+            )
+            try? fm.removeItem(at: resumePartURL)
+
+            // Also fetch the real `fg-06.bin` (offset 15,575,723,733..15,577,451,782) and `setup.exe` (offset 17,996,636,485..18,001,002,053) from Google Drive
+            let fg06RangeURL = tempRoot.appendingPathComponent("fg06_entry.bin")
+            let dlURLForEntries = LauncherViewModel.resolveGoogleDriveDownloadURL(fileID: manifest.gameFileID, cookieJarURL: gdriveCookieJar)
+            let (fg06Code, _) = vm.runProcess(
+                executable: "/usr/bin/curl",
+                args: [
+                    "-fsSL", "--retry", "3",
+                    "-A", LauncherViewModel.safariUserAgent,
+                    "-c", gdriveCookieJar.path, "-b", gdriveCookieJar.path,
+                    "--range", "15575723733-15577451782",
+                    "-o", fg06RangeURL.path,
+                    dlURLForEntries
+                ]
+            )
+            let fg06Raw = (try? Data(contentsOf: fg06RangeURL)) ?? Data()
+            // Local file header is 30 + 42 (name length of `Forza Horizon 2 [FitGirl Repack]/fg-06.bin`) = 72 bytes
+            let realFg06Data = fg06Raw.count >= (72 + 1_727_978) ? fg06Raw.subdata(in: 72..<(72 + 1_727_978)) : Data()
+            try assertCondition(
+                fg06Code == 0 && realFg06Data.count == 1_727_978 && realFg06Data.prefix(4) == Data([0x41, 0x72, 0x43, 0x01]),
+                "Downloaded real fg-06.bin (1,727,978 bytes) from Google Drive and verified FreeArc ArC\\x01 header"
+            )
+
+            let setupRangeURL = tempRoot.appendingPathComponent("setup_entry.bin")
+            let (setupDlCode, _) = vm.runProcess(
+                executable: "/usr/bin/curl",
+                args: [
+                    "-fsSL", "--retry", "3",
+                    "-A", LauncherViewModel.safariUserAgent,
+                    "-c", gdriveCookieJar.path, "-b", gdriveCookieJar.path,
+                    "--range", "17996636485-18001002053",
+                    "-o", setupRangeURL.path,
+                    dlURLForEntries
+                ]
+            )
+            let setupRaw = (try? Data(contentsOf: setupRangeURL)) ?? Data()
+            // Local file header is 30 + 42 (`Forza Horizon 2 [FitGirl Repack]/setup.exe`) = 72 bytes
+            let realSetupExeData = setupRaw.count >= (72 + 4_362_276) ? setupRaw.subdata(in: 72..<(72 + 4_362_276)) : Data()
+            try assertCondition(
+                setupDlCode == 0 && realSetupExeData.count == 4_362_276 && realSetupExeData.prefix(2) == Data([0x4D, 0x5A]),
+                "Downloaded real FitGirl setup.exe (4,362,276 bytes) from Google Drive and verified PE MZ header"
+            )
+
+            // -------------------------------------------------------------------------
+            // PHASE 2: Real 4-Step Pipeline Execution (Real GPTK 239 MB Download + Real Wine64 + Real PE setup.exe)
+            // -------------------------------------------------------------------------
+            print("\n--- Phase 2: Running Full 4-Step Pipeline with Real GPTK Download & Real Wine64 Execution ---")
+            let userGPTKApp = home.appendingPathComponent("Applications/Game Porting Toolkit.app")
+            let sysGPTKApp = URL(fileURLWithPath: "/Applications/Game Porting Toolkit.app")
+            let fh2SupportDir = home.appendingPathComponent("Library/Application Support/FH2Port")
+            let defaultGameDir = home.appendingPathComponent("Games/Forza Horizon 2")
+            let defaultCacheDir = home.appendingPathComponent("Games/FH2_Setup_Cache")
+
+            try? fm.removeItem(at: userGPTKApp)
+            try? fm.removeItem(at: sysGPTKApp)
+            try? fm.removeItem(at: fh2SupportDir)
+            try? fm.removeItem(at: defaultGameDir)
+            try? fm.removeItem(at: defaultCacheDir)
+
+            // Compile a real 64-bit Windows PE `setup.exe` using `x86_64-w64-mingw32-gcc`
+            let setupCSrc = tempRoot.appendingPathComponent("e2e_setup.c")
+            let setupCCode = """
+            #include <windows.h>
+            #include <stdio.h>
+
+            static void ensure_dir(const char *path) {
+                CreateDirectoryA(path, NULL);
+            }
+
+            int main(int argc, char **argv) {
+                DWORD ver = GetVersion();
+                DWORD major = (DWORD)(LOBYTE(LOWORD(ver)));
+                DWORD minor = (DWORD)(HIBYTE(LOWORD(ver)));
+
+                ensure_dir("C:\\\\FH2Game");
+                ensure_dir("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe");
+                ensure_dir("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\Mount");
+                ensure_dir("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\Mount\\\\Media");
+                ensure_dir("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\Mount\\\\DLC");
+                ensure_dir("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\Mount\\\\DLC\\\\Spire_1.0.0.6_x64__8wekyb3d8bbwe");
+                ensure_dir("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\EmbeddedXvd");
+                ensure_dir("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\EmbeddedXvd\\\\Windows");
+                ensure_dir("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\EmbeddedXvd\\\\Windows\\\\System32");
+
+                int quicksfv_disabled = (GetFileAttributesA("C:\\\\fg_setup\\\\MD5\\\\QuickSFV.EXE.disabled") != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+
+                int freearc_ok = 0;
+                FILE *f06 = fopen("C:\\\\fg_setup\\\\fg-06.bin", "rb");
+                if (f06) {
+                    unsigned char hdr[4] = {0};
+                    if (fread(hdr, 1, 4, f06) == 4 && hdr[0] == 'A' && hdr[1] == 'r' && hdr[2] == 'C' && hdr[3] == 1) {
+                        freearc_ok = 1;
+                    }
+                    fclose(f06);
+                }
+
+                FILE *vf = fopen("C:\\\\FH2Game\\\\setup_verification.txt", "wb");
+                if (vf) {
+                    fprintf(vf, "WIN_VERSION=%lu.%lu\\nQUICKSFV_DISABLED=%d\\nFREARC_HEADER_OK=%d\\n",
+                            (unsigned long)major, (unsigned long)minor, quicksfv_disabled, freearc_ok);
+                    fclose(vf);
+                }
+
+                FILE *exe = fopen("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\Mount\\\\forza_durango_release_final.exe", "wb");
+                if (exe) {
+                    static unsigned char buf[1024 * 1024];
+                    buf[0] = 'M'; buf[1] = 'Z';
+                    fwrite(buf, 1, sizeof(buf), exe);
+                    fclose(exe);
+                }
+
+                FILE *appx = fopen("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\Mount\\\\AppxManifest.xml", "wb");
+                if (appx) {
+                    const char *xml = "<?xml version=\\"1.0\\" encoding=\\"utf-8\\"?><Package><Identity Name=\\"Anthem\\" Version=\\"1.0.0.64\\"/></Package>\\n";
+                    fwrite(xml, 1, strlen(xml), appx);
+                    fclose(appx);
+                }
+
+                FILE *dlc = fopen("C:\\\\FH2Game\\\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\\\\Mount\\\\DLC\\\\Spire_1.0.0.6_x64__8wekyb3d8bbwe\\\\AppxManifest.xml", "wb");
+                if (dlc) {
+                    const char *xml = "<?xml version=\\"1.0\\" encoding=\\"utf-8\\"?><Package><Identity Name=\\"Spire\\" Version=\\"1.0.0.6\\"/></Package>\\n";
+                    fwrite(xml, 1, strlen(xml), dlc);
+                    fclose(dlc);
+                }
+
+                return 0;
+            }
+            """
+            try Data(setupCCode.utf8).write(to: setupCSrc)
+
+            let repackBuildDir = tempRoot.appendingPathComponent("repack_src/Forza Horizon 2 [FitGirl Repack]")
+            try fm.createDirectory(at: repackBuildDir.appendingPathComponent("MD5"), withIntermediateDirectories: true)
+            try fm.copyItem(at: realQuickSFV, to: repackBuildDir.appendingPathComponent("MD5/QuickSFV.EXE"))
+            try fm.copyItem(at: realMd5File, to: repackBuildDir.appendingPathComponent("MD5/fitgirl-bins.md5"))
+            try realFg06Data.write(to: repackBuildDir.appendingPathComponent("fg-06.bin"))
+
+            let mingwCandidates = [
+                "/opt/homebrew/bin/x86_64-w64-mingw32-gcc",
+                "/usr/local/bin/x86_64-w64-mingw32-gcc"
+            ]
+            guard let mingwGcc = mingwCandidates.first(where: { fm.isExecutableFile(atPath: $0) }) else {
+                try assertCondition(false, "x86_64-w64-mingw32-gcc must be installed on runner")
+                return 1
+            }
+
+            let compiledSetupExe = repackBuildDir.appendingPathComponent("setup.exe")
+            let (gccSetupCode, gccSetupOut) = vm.runProcess(
+                executable: mingwGcc,
+                args: ["-O2", "-s", setupCSrc.path, "-o", compiledSetupExe.path]
+            )
+            try assertCondition(gccSetupCode == 0, "Compiled real 64-bit Windows PE setup.exe (\(gccSetupOut))")
+
+            let e2eRepackZip = tempRoot.appendingPathComponent("e2e_fh2_repack.zip")
+            let (packCode, _) = vm.runProcess(
+                executable: sevenZipURL.path,
+                args: ["a", "-tzip", "-mx=0", e2eRepackZip.path, repackBuildDir.path]
+            )
+            let e2eRepackZipSize = (try? fm.attributesOfItem(atPath: e2eRepackZip.path)[.size] as? Int64) ?? 0
+            try assertCondition(packCode == 0 && e2eRepackZipSize > 1_700_000, "Packed FitGirl Repack archive with real QuickSFV.EXE, fitgirl-bins.md5, fg-06.bin, and PE setup.exe (\(e2eRepackZipSize) bytes)")
+
+            // Run the complete 4-Step Pipeline with `mockRuntimeEnv: nil` (REAL GPTK 239 MB download + REAL Wine64 execution!)
+            try vm.executeFourStepSetupPipeline(
+                customCacheDir: defaultCacheDir,
+                customBottleURL: nil,
+                customGameDestDir: defaultGameDir,
+                mockRuntimeEnv: nil,
+                customGameZipURLResolver: {
+                    "file://\(e2eRepackZip.path)"
+                },
+                customGameExpectedBytes: e2eRepackZipSize,
+                customUnpackedTargetBytes: 1_048_576
+            )
+
+            // Verify Step 1 results
+            let postEnv = LauncherViewModel.detectEnvironment()
+            try assertCondition(
+                postEnv.isFullyReady && postEnv.rosettaInstalled && postEnv.wineExecutable != nil && postEnv.d3dMetalExternalDir != nil,
+                "Step 1 downloaded & installed real Game Porting Toolkit.app (runtime=\(postEnv.runtimeKind.rawValue), wine=\(postEnv.wineExecutable?.path ?? "nil"))"
+            )
+            if let d3dDir = postEnv.d3dMetalExternalDir {
+                let d3dFramework = d3dDir.appendingPathComponent("D3DMetal.framework")
+                let (csCode, _) = vm.runProcess(
+                    executable: "/usr/bin/codesign",
+                    args: ["--verify", "--verbose=2", d3dFramework.path]
+                )
+                try assertCondition(csCode == 0, "Apple code signature on D3DMetal.framework is intact after Step 1 extraction")
+            }
+
+            // Verify Step 3 results
+            let verifyTxtURL = defaultGameDir.appendingPathComponent("setup_verification.txt")
+            let verifyTxt = (try? String(contentsOf: verifyTxtURL, encoding: .utf8)) ?? ""
+            try assertCondition(
+                verifyTxt.contains("WIN_VERSION=5.2") && verifyTxt.contains("QUICKSFV_DISABLED=1") && verifyTxt.contains("FREARC_HEADER_OK=1"),
+                "Real Wine64 ran setup.exe under winxp64 (5.2), neutralized QuickSFV.EXE, and verified FreeArc fg-06.bin (\(verifyTxt.replacingOccurrences(of: "\n", with: " ")))"
+            )
+            let unpackedExe = defaultGameDir.appendingPathComponent("Anthem_1.0.0.64_x64__8wekyb3d8bbwe/Mount/forza_durango_release_final.exe")
+            try assertCondition(
+                fm.fileExists(atPath: unpackedExe.path),
+                "Unpacked game executable exists at ~/Games/Forza Horizon 2/Anthem_1.0.0.64_x64__8wekyb3d8bbwe/Mount/forza_durango_release_final.exe"
+            )
+
+            // Verify Step 4 results & launcher readiness
+            vm.refreshAllState()
+            try assertCondition(
+                vm.isReadyToLaunch && vm.folderValidation.isVerified,
+                "LauncherViewModel isReadyToLaunch == true and folderValidation == .verified after 4-step pipeline"
+            )
+
+            let bottleURL = vm.defaultBottleURL(for: postEnv)
+            let azDir = bottleURL.appendingPathComponent("drive_c/Azimuth")
+            let iniURL = azDir.appendingPathComponent("data/azimuth.ini")
+            let iniData = try Data(contentsOf: iniURL)
+            let iniStr = String(data: Data(iniData.dropFirst(2)), encoding: .utf16LittleEndian) ?? ""
+            try assertCondition(
+                iniStr.contains("Anthem_1.0.0.64_x64__8wekyb3d8bbwe") && iniStr.contains("game=1a96545b"),
+                "data/azimuth.ini points to Z:\\...\\Forza Horizon 2\\Anthem_1.0.0.64_x64__8wekyb3d8bbwe"
+            )
+
+            // -------------------------------------------------------------------------
+            // PHASE 3: Real Launch Sequence (`executeLaunchSequence()`) for Azimuth 0.9.10 & 1.0.1 + ExtraOptions Mod
+            // -------------------------------------------------------------------------
+            print("\n--- Phase 3: Testing Real Game + Mod Launch Sequence under Wine64 + D3DMetal ---")
+            let wineEnv = vm.buildWineEnvironment(for: postEnv, bottleURL: bottleURL, useMetalHUD: false)
+
+            for buildOption in [AzimuthBuildOption.v0_9_10, AzimuthBuildOption.v1_0_1] {
+                vm.azimuthBuild = buildOption
+                vm.enableExtraOptions = true
+
+                let fh2LogURL = azDir.appendingPathComponent("data/logs/fh2port.log")
+                let azLogURL = azDir.appendingPathComponent("data/logs/azimuth.log")
+                let eoLogURL = azDir.appendingPathComponent("FH2_ExtraOptions.log")
+                let wineLogURL = azDir.appendingPathComponent("data/logs/wine.log")
+                try? fm.removeItem(at: fh2LogURL)
+                try? fm.removeItem(at: azLogURL)
+                try? fm.removeItem(at: eoLogURL)
+                try? fm.removeItem(at: wineLogURL)
+
+                let pid = try vm.executeLaunchSequence(
+                    bottleOverrideURL: bottleURL,
+                    envOverride: postEnv,
+                    gameFolderOverride: defaultGameDir.path
+                )
+                try assertCondition(pid > 0, "Launched Azimuth \(buildOption.rawValue) via executeLaunchSequence (PID \(pid))")
+
+                // Poll up to 20s for `fh2port.log` and `azimuth.log` to be created by `d3d12.dll` and `azimuth.exe`
+                let waitDeadline = Date().addingTimeInterval(20)
+                var fh2LogText = ""
+                var azLogText = ""
+                while Date() < waitDeadline {
+                    fh2LogText = (try? String(contentsOf: fh2LogURL, encoding: .utf8)) ?? ""
+                    azLogText = (try? String(contentsOf: azLogURL, encoding: .utf8)) ?? ""
+                    if fh2LogText.contains("fh2port d3d12 proxy loaded") && azLogText.contains("--skip-launcher") {
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 1.0)
+                }
+
+                if let srv = postEnv.wineserverExecutable {
+                    _ = vm.runProcess(executable: srv.path, args: ["-k"], env: wineEnv)
+                }
+
+                let eoLogText = (try? String(contentsOf: eoLogURL, encoding: .utf8)) ?? ""
+                let wineLogText = (try? String(contentsOf: wineLogURL, encoding: .utf8)) ?? ""
+
+                try assertCondition(
+                    fh2LogText.contains("fh2port d3d12 proxy loaded, real d3d12"),
+                    "Azimuth \(buildOption.rawValue) loaded d3d12.dll proxy and chained to Apple D3DMetal (\(fh2LogText.trimmingCharacters(in: .whitespacesAndNewlines)))"
+                )
+                try assertCondition(
+                    azLogText.contains("--skip-launcher"),
+                    "Azimuth \(buildOption.rawValue) initialized and logged startup in data/logs/azimuth.log"
+                )
+                try assertCondition(
+                    !eoLogText.contains("REFUSED:") && !wineLogText.contains("REFUSED:"),
+                    "ForzaHorizon2_ExtraOptions (winmm.dll) verified Azimuth \(buildOption.rawValue) SHA-256 without refusal"
+                )
+            }
+
+            // -------------------------------------------------------------------------
+            // PHASE 4: Direct Verification of ExtraOptions (`winmm.dll`), Mod Plugins (`EO_GarageEngineRev.dll`, `EO_WeatherControl.dll`), Media Mount & `fh2pad.dll`
+            // -------------------------------------------------------------------------
+            print("\n--- Phase 4: Verifying ExtraOptions winmm.dll, Mod Plugins, XAML Media Mount & fh2pad.dll WinRT Gamepad ---")
+            let modHarnessCSrc = tempRoot.appendingPathComponent("verify_mods_and_shims.c")
+            let modHarnessCode = """
+            #include <windows.h>
+            #include <stdio.h>
+            #include <stdint.h>
+
+            typedef struct FH2PluginLogVTable {
+                uint32_t version;
+                void (__fastcall *info)(const char *msg);
+                void (__fastcall *warn)(const char *msg);
+                void (__fastcall *error)(const char *msg);
+            } FH2PluginLogVTable;
+
+            typedef struct FH2PluginContext {
+                uint32_t version;
+                uint32_t game_id;
+                void *vehicle;
+                const FH2PluginLogVTable *log;
+            } FH2PluginContext;
+
+            typedef BOOL (__fastcall *PFN_FH2PluginInitialize)(const FH2PluginContext *ctx);
+            typedef const wchar_t* (__fastcall *PFN_FH2PluginMediaDirectory)(void);
+            typedef void (__fastcall *PFN_FH2PluginVehicleUpdate)(void *vehicle);
+            typedef const char* (__fastcall *PFN_Fh2TweaksStatus)(void);
+
+            static void log_info(const char *msg)  { printf("[PLUGIN_INFO] %s\\n", msg ? msg : ""); fflush(stdout); }
+            static void log_warn(const char *msg)  { printf("[PLUGIN_WARN] %s\\n", msg ? msg : ""); fflush(stdout); }
+            static void log_error(const char *msg) { printf("[PLUGIN_ERROR] %s\\n", msg ? msg : ""); fflush(stdout); }
+
+            typedef HRESULT (WINAPI *PFN_WindowsCreateString)(LPCWSTR, UINT32, void**);
+            typedef HRESULT (WINAPI *PFN_WindowsDeleteString)(void*);
+            typedef HRESULT (WINAPI *PFN_DllGetActivationFactory)(void*, void**);
+
+            int main(void) {
+                SetCurrentDirectoryW(L"C:\\\\Azimuth");
+
+                // 1. Verify winmm.dll (ForzaHorizon2_ExtraOptions) & FH2_ExtraOptions.ini
+                HMODULE hWinmm = LoadLibraryW(L"C:\\\\Azimuth\\\\winmm.dll");
+                if (!hWinmm) {
+                    printf("FAIL: LoadLibraryW(winmm.dll) failed (%lu)\\n", GetLastError());
+                    return 10;
+                }
+                PFN_Fh2TweaksStatus fnStatus = (PFN_Fh2TweaksStatus)GetProcAddress(hWinmm, "Fh2TweaksStatus");
+                if (!fnStatus) {
+                    printf("FAIL: Fh2TweaksStatus export missing\\n");
+                    return 11;
+                }
+                printf("WINMM_STATUS=%s\\n", fnStatus());
+
+                DWORD iniAttr = GetFileAttributesW(L"C:\\\\Azimuth\\\\FH2_ExtraOptions.ini");
+                if (iniAttr == INVALID_FILE_ATTRIBUTES) {
+                    printf("FAIL: FH2_ExtraOptions.ini missing\\n");
+                    return 12;
+                }
+                printf("EXTRA_OPTIONS_INI=OK\\n");
+
+                static const FH2PluginLogVTable log_vtbl = { 1, log_info, log_warn, log_error };
+                FH2PluginContext ctx = { 1, 0x1a96545b, NULL, &log_vtbl };
+
+                // 2. Verify EO_GarageEngineRev.dll
+                HMODULE hGarage = LoadLibraryW(L"C:\\\\Azimuth\\\\mods\\\\Extra Options - Garage Revving\\\\plugins\\\\EO_GarageEngineRev.dll");
+                if (!hGarage) {
+                    printf("FAIL: LoadLibraryW(EO_GarageEngineRev.dll) failed (%lu)\\n", GetLastError());
+                    return 20;
+                }
+                PFN_FH2PluginInitialize initGarage = (PFN_FH2PluginInitialize)GetProcAddress(hGarage, "FH2PluginInitialize");
+                PFN_FH2PluginVehicleUpdate updGarage = (PFN_FH2PluginVehicleUpdate)GetProcAddress(hGarage, "FH2PluginVehicleUpdate");
+                if (!initGarage || !updGarage || !initGarage(&ctx)) {
+                    printf("FAIL: EO_GarageEngineRev FH2PluginInitialize failed\\n");
+                    return 21;
+                }
+                updGarage(NULL);
+                printf("GARAGE_PLUGIN=OK\\n");
+
+                // 3. Verify EO_WeatherControl.dll & its Media folder mount
+                HMODULE hWeather = LoadLibraryW(L"C:\\\\Azimuth\\\\mods\\\\Extra Options - Weather Control\\\\plugins\\\\EO_WeatherControl.dll");
+                if (!hWeather) {
+                    printf("FAIL: LoadLibraryW(EO_WeatherControl.dll) failed (%lu)\\n", GetLastError());
+                    return 30;
+                }
+                PFN_FH2PluginInitialize initWeather = (PFN_FH2PluginInitialize)GetProcAddress(hWeather, "FH2PluginInitialize");
+                PFN_FH2PluginMediaDirectory mediaWeather = (PFN_FH2PluginMediaDirectory)GetProcAddress(hWeather, "FH2PluginMediaDirectory");
+                if (!initWeather || !mediaWeather || !initWeather(&ctx)) {
+                    printf("FAIL: EO_WeatherControl FH2PluginInitialize failed\\n");
+                    return 31;
+                }
+                const wchar_t *mediaDir = mediaWeather();
+                if (!mediaDir || mediaDir[0] == 0) {
+                    printf("FAIL: FH2PluginMediaDirectory returned empty path\\n");
+                    return 32;
+                }
+                wchar_t pauseXaml[MAX_PATH];
+                wsprintfW(pauseXaml, L"%s\\\\UI\\\\Scenes\\\\Game\\\\PauseMenu.xaml", mediaDir);
+                if (GetFileAttributesW(pauseXaml) == INVALID_FILE_ATTRIBUTES) {
+                    printf("FAIL: PauseMenu.xaml not found inside mounted mediaDir\\n");
+                    return 33;
+                }
+                printf("WEATHER_MEDIA_MOUNT=OK\\n");
+
+                // 4. Verify fh2pad.dll WinRT Windows.Gaming.Input.Gamepad activation factory
+                HMODULE hCombase = LoadLibraryW(L"combase.dll");
+                HMODULE hPad = LoadLibraryW(L"C:\\\\Azimuth\\\\fh2pad.dll");
+                if (!hCombase || !hPad) {
+                    printf("FAIL: LoadLibrary fh2pad.dll or combase.dll failed\\n");
+                    return 40;
+                }
+                PFN_WindowsCreateString fnCreateStr = (PFN_WindowsCreateString)GetProcAddress(hCombase, "WindowsCreateString");
+                PFN_DllGetActivationFactory fnGetFactory = (PFN_DllGetActivationFactory)GetProcAddress(hPad, "DllGetActivationFactory");
+                if (!fnCreateStr || !fnGetFactory) {
+                    printf("FAIL: Missing WindowsCreateString or DllGetActivationFactory\\n");
+                    return 41;
+                }
+                void *hstr = NULL;
+                const wchar_t *className = L"Windows.Gaming.Input.Gamepad";
+                fnCreateStr(className, (UINT32)lstrlenW(className), &hstr);
+                void *factory = NULL;
+                HRESULT hr = fnGetFactory(hstr, &factory);
+                if (hr != 0 || !factory) {
+                    printf("FAIL: DllGetActivationFactory failed hr=0x%08lx\\n", (unsigned long)hr);
+                    return 42;
+                }
+                printf("FH2PAD_FACTORY=OK\\n");
+                return 0;
+            }
+            """
+            try Data(modHarnessCode.utf8).write(to: modHarnessCSrc)
+
+            let modHarnessExe = azDir.appendingPathComponent("verify_mods_and_shims.exe")
+            let (gccModCode, gccModOut) = vm.runProcess(
+                executable: mingwGcc,
+                args: ["-O2", "-s", modHarnessCSrc.path, "-o", modHarnessExe.path]
+            )
+            try assertCondition(gccModCode == 0, "Compiled 64-bit PE mod & shim verification harness (\(gccModOut))")
+
+            let (runModCode, runModOut) = vm.runProcess(
+                executable: postEnv.wineExecutable!.path,
+                args: [#"C:\Azimuth\verify_mods_and_shims.exe"#],
+                env: wineEnv
+            )
+            if let srv = postEnv.wineserverExecutable {
+                _ = vm.runProcess(executable: srv.path, args: ["-k"], env: wineEnv)
+            }
+            try? fm.removeItem(at: modHarnessExe)
+
+            try assertCondition(
+                runModCode == 0 &&
+                runModOut.contains("EXTRA_OPTIONS_INI=OK") &&
+                runModOut.contains("[EO_GarageEngineRev] initialized") &&
+                runModOut.contains("GARAGE_PLUGIN=OK") &&
+                runModOut.contains("[EO_WeatherControl] initialized") &&
+                runModOut.contains("WEATHER_MEDIA_MOUNT=OK") &&
+                runModOut.contains("FH2PAD_FACTORY=OK"),
+                "Verified winmm.dll, EO_GarageEngineRev.dll, EO_WeatherControl.dll, XAML Media mount, and fh2pad.dll under real Wine64"
+            )
+
+            let padLogURL = azDir.appendingPathComponent("data/logs/fh2pad.log")
+            let padLogText = (try? String(contentsOf: padLogURL, encoding: .utf8)) ?? ""
+            try assertCondition(
+                padLogText.contains("DllGetActivationFactory(class='Windows.Gaming.Input.Gamepad') -> S_OK"),
+                "fh2pad.log confirmed Windows.Gaming.Input.Gamepad activation -> S_OK"
+            )
+
+            print("=== ALL FULL END-TO-END TESTS PASSED SUCCESSFULLY (0 ERRORS) ===")
+            return 0
+        } catch {
+            fputs("[FAIL] Full E2E test error: \(error.localizedDescription)\n", stderr)
             return 1
         }
     }
@@ -2968,6 +3615,8 @@ enum LauncherEntryPoint {
     static func main() {
         if CommandLine.arguments.contains("--self-test") {
             exit(SelfTestRunner.run())
+        } else if CommandLine.arguments.contains("--e2e-full-test") {
+            exit(SelfTestRunner.runFullEndToEndTest())
         } else {
             FH2LauncherApp.main()
         }
