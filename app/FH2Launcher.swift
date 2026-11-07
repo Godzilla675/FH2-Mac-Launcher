@@ -233,7 +233,7 @@ final class LauncherViewModel: ObservableObject {
     let cacheDirURL: URL
     let defaultInstalledGameDirURL: URL
     private var cancellables = Set<AnyCancellable>()
-    private var activeDownloadProcess: Process? = nil
+    var activeDownloadProcess: Process? = nil
     private let sleepPreventionLock = NSLock()
     private var setupActivityToken: NSObjectProtocol? = nil
     private var caffeinateProcess: Process? = nil
