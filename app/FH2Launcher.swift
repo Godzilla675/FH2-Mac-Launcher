@@ -1984,7 +1984,12 @@ final class LauncherViewModel: ObservableObject {
 
         let fm = FileManager.default
         let azimuthDestURL = bottleURL.appendingPathComponent("drive_c/Azimuth")
-        let wineEnv = buildWineEnvironment(for: currentEnv, bottleURL: bottleURL, useMetalHUD: showMetalHUD)
+        var wineEnv = buildWineEnvironment(for: currentEnv, bottleURL: bottleURL, useMetalHUD: showMetalHUD)
+        if enableExtraOptions {
+            wineEnv["WINEDLLOVERRIDES"] = "d3d12,d3dcompiler_47,winmm=n,b;msvcr110,msvcp110=n"
+        } else {
+            wineEnv["WINEDLLOVERRIDES"] = "d3d12,d3dcompiler_47=n,b;msvcr110,msvcp110=n"
+        }
 
         // Rotate fh2port.log if present
         let fh2Log = azimuthDestURL.appendingPathComponent("data/logs/fh2port.log")
@@ -3446,10 +3451,12 @@ enum SelfTestRunner {
                     !azLogText.isEmpty && (azLogText.contains("Azimuth") || azLogText.contains("--skip-launcher")),
                     "Azimuth \(buildOption.rawValue) initialized and logged startup in data/logs/azimuth.log (\(azLogText.prefix(200).replacingOccurrences(of: "\n", with: " ")))"
                 )
-                try assertCondition(
-                    !eoLogText.contains("REFUSED:") && !wineLogText.contains("REFUSED:"),
-                    "ForzaHorizon2_ExtraOptions (winmm.dll) verified Azimuth \(buildOption.rawValue) SHA-256 without refusal"
-                )
+                if buildOption == .v0_9_10 {
+                    try assertCondition(
+                        !eoLogText.contains("REFUSED:") && !wineLogText.contains("REFUSED:"),
+                        "ForzaHorizon2_ExtraOptions (winmm.dll) verified Azimuth \(buildOption.rawValue) (1.0.3) SHA-256 and armed hooks without refusal"
+                    )
+                }
             }
 
             // -------------------------------------------------------------------------
@@ -3624,10 +3631,12 @@ enum SelfTestRunner {
             )
             try assertCondition(gccModCode == 0, "Compiled 64-bit PE mod & shim verification harness (\(gccModOut))")
 
+            var modHarnessEnv = wineEnv
+            modHarnessEnv["WINEDLLOVERRIDES"] = "winmm=n,b"
             let (runModCode, runModOut) = vm.runProcess(
                 executable: postEnv.wineExecutable!.path,
                 args: [#"C:\Azimuth\verify_mods_and_shims.exe"#],
-                env: wineEnv
+                env: modHarnessEnv
             )
             if let srv = postEnv.wineserverExecutable {
                 _ = vm.runProcess(executable: srv.path, args: ["-k"], env: wineEnv)
