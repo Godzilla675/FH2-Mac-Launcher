@@ -3657,10 +3657,10 @@ enum SelfTestRunner {
                     printf("FAIL: FH2PluginMediaDirectory returned empty path\\n");
                     return 32;
                 }
-                wchar_t pauseXaml[MAX_PATH];
-                wsprintfW(pauseXaml, L"%s\\\\UI\\\\Scenes\\\\Game\\\\PauseMenu.xaml", mediaDir);
-                if (GetFileAttributesW(pauseXaml) == INVALID_FILE_ATTRIBUTES) {
-                    printf("FAIL: PauseMenu.xaml not found inside mounted mediaDir\\n");
+                wchar_t weatherXaml[MAX_PATH];
+                wsprintfW(weatherXaml, L"%s\\\\UI\\\\Scenes\\\\Anthem\\\\EO_WeatherControl_EN.xaml", mediaDir);
+                if (GetFileAttributesW(weatherXaml) == INVALID_FILE_ATTRIBUTES) {
+                    printf("FAIL: EO_WeatherControl_EN.xaml not found inside mounted mediaDir (mediaDir=%ls)\\n", mediaDir);
                     return 33;
                 }
                 printf("WEATHER_MEDIA_MOUNT=OK\\n");
