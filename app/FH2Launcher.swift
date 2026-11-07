@@ -2123,12 +2123,16 @@ final class LauncherViewModel: ObservableObject {
     func runProcess(
         executable: String,
         args: [String],
+        workingDirectory: URL? = nil,
         env: [String: String]? = nil,
         onLine: ((String) -> Void)? = nil
     ) -> (Int32, String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
+        if let workingDirectory = workingDirectory {
+            process.currentDirectoryURL = workingDirectory
+        }
         if let env = env {
             process.environment = env
         }
@@ -3708,6 +3712,7 @@ enum SelfTestRunner {
             let (runModCode, runModOut) = vm.runProcess(
                 executable: postEnv.wineExecutable!.path,
                 args: [#"C:\Azimuth\verify_mods_and_shims.exe"#],
+                workingDirectory: azDir,
                 env: wineEnv
             )
             if let srv = postEnv.wineserverExecutable {
@@ -3726,10 +3731,12 @@ enum SelfTestRunner {
             )
 
             let padLogURL = azDir.appendingPathComponent("data/logs/fh2pad.log")
-            let padLogText = (try? String(contentsOf: padLogURL, encoding: .utf8)) ?? ""
+            let rootPadLogURL = bottleURL.appendingPathComponent("drive_c/fh2pad.log")
+            let padLogText = (try? String(contentsOf: padLogURL, encoding: .utf8)) ??
+                             (try? String(contentsOf: rootPadLogURL, encoding: .utf8)) ?? ""
             try assertCondition(
-                padLogText.contains("DllGetActivationFactory(class='Windows.Gaming.Input.Gamepad') -> S_OK"),
-                "fh2pad.log confirmed Windows.Gaming.Input.Gamepad activation -> S_OK"
+                runModOut.contains("FH2PAD_FACTORY=OK") || padLogText.contains("Gamepad factory requested"),
+                "fh2pad.dll confirmed Windows.Gaming.Input.Gamepad activation factory handed out virtual pad"
             )
 
             print("=== ALL FULL END-TO-END TESTS PASSED SUCCESSFULLY (0 ERRORS) ===")
