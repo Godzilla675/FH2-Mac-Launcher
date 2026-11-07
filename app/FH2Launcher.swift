@@ -3084,30 +3084,30 @@ enum SelfTestRunner {
             // -------------------------------------------------------------------------
             print("\n--- Phase 1: Testing Live Google Drive Bounded-Range Auto-Resume & Mid-Stream Disconnect Recovery ---")
             let gdriveCookieJar = tempRoot.appendingPathComponent("e2e_gdrive_cookies.txt")
-            let resumePartURL = tempRoot.appendingPathComponent("e2e_gdrive_8mb.zip.part")
-            let resumeFinalURL = tempRoot.appendingPathComponent("e2e_gdrive_8mb.zip")
-            let targetSliceBytes: Int64 = 8 * 1024 * 1024 // 8 MiB
+            let resumePartURL = tempRoot.appendingPathComponent("e2e_gdrive_32mb.zip.part")
+            let resumeFinalURL = tempRoot.appendingPathComponent("e2e_gdrive_32mb.zip")
+            let targetSliceBytes: Int64 = 32 * 1024 * 1024 // 32 MiB
 
             var didInjectMidStreamDrop = false
             var sizeAtDrop: Int64 = 0
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .userInteractive).async {
                 let chunkURL = resumePartURL.appendingPathExtension("chunk")
                 let deadline = Date().addingTimeInterval(60)
                 while Date() < deadline && !didInjectMidStreamDrop {
                     let cSize = (try? fm.attributesOfItem(atPath: chunkURL.path)[.size] as? Int64) ?? 0
-                    if cSize >= 524_288, let proc = vm.activeDownloadProcess, proc.isRunning {
+                    if cSize >= 65_536, let proc = vm.activeDownloadProcess, proc.isRunning {
                         sizeAtDrop = cSize
                         didInjectMidStreamDrop = true
                         print("[E2E] Injecting simulated network disconnect (SIGTERM) at chunk size \(cSize) bytes...")
                         proc.terminate()
                         break
                     }
-                    Thread.sleep(forTimeInterval: 0.1)
+                    Thread.sleep(forTimeInterval: 0.001)
                 }
             }
 
             try vm.downloadWithAutoResume(
-                label: "E2E Google Drive 8 MiB Auto-Resume Slice",
+                label: "E2E Google Drive 32 MiB Auto-Resume Slice",
                 partFileURL: resumePartURL,
                 finalFileURL: resumeFinalURL,
                 cookieJarURL: gdriveCookieJar,
@@ -3128,12 +3128,12 @@ enum SelfTestRunner {
             let finalSliceSize = (try? fm.attributesOfItem(atPath: resumeFinalURL.path)[.size] as? Int64) ?? 0
             let sliceHeader = (try? FileHandle(forReadingFrom: resumeFinalURL).read(upToCount: 4)) ?? Data()
             try assertCondition(
-                didInjectMidStreamDrop && sizeAtDrop >= 524_288,
+                didInjectMidStreamDrop && sizeAtDrop >= 65_536,
                 "Injected mid-stream disconnect during live Google Drive download at \(sizeAtDrop) bytes"
             )
             try assertCondition(
                 finalSliceSize == targetSliceBytes && sliceHeader == Data([0x50, 0x4B, 0x03, 0x04]),
-                "downloadWithAutoResume preserved partial chunk bytes across disconnect and completed exact 8 MiB slice (\(finalSliceSize) bytes) with intact PK\\x03\\x04 header"
+                "downloadWithAutoResume preserved partial chunk bytes across disconnect and completed exact 32 MiB slice (\(finalSliceSize) bytes) with intact PK\\x03\\x04 header"
             )
 
             // Extract real `MD5/QuickSFV.EXE` and `MD5/fitgirl-bins.md5` from the 8 MiB slice
