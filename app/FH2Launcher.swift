@@ -3085,6 +3085,7 @@ enum SelfTestRunner {
             print("\n--- Phase 1: Testing Live Google Drive Bounded-Range Auto-Resume & Mid-Stream Disconnect Recovery ---")
             let gdriveCookieJar = tempRoot.appendingPathComponent("e2e_gdrive_cookies.txt")
             let resumePartURL = tempRoot.appendingPathComponent("e2e_gdrive_8mb.zip.part")
+            let resumeFinalURL = tempRoot.appendingPathComponent("e2e_gdrive_8mb.zip")
             let targetSliceBytes: Int64 = 8 * 1024 * 1024 // 8 MiB
 
             var didInjectMidStreamDrop = false
@@ -3107,25 +3108,25 @@ enum SelfTestRunner {
 
             try vm.downloadWithAutoResume(
                 label: "E2E Google Drive 8 MiB Auto-Resume Slice",
+                partFileURL: resumePartURL,
+                finalFileURL: resumeFinalURL,
+                cookieJarURL: gdriveCookieJar,
+                expectedBytes: targetSliceBytes,
+                requireZipMagic: true,
                 urlResolver: {
                     LauncherViewModel.resolveGoogleDriveDownloadURL(
                         fileID: manifest.gameFileID,
                         cookieJarURL: gdriveCookieJar
                     )
                 },
-                cookieJarURL: gdriveCookieJar,
-                partFileURL: resumePartURL,
-                finalFileURL: nil,
-                expectedBytes: targetSliceBytes,
-                requireZipMagic: true,
                 onProgress: { _, _, _ in },
                 onInterrupted: { downloaded, _ in
                     print("[E2E] onInterrupted callback fired with preserved bytes = \(downloaded)")
                 }
             )
 
-            let finalSliceSize = (try? fm.attributesOfItem(atPath: resumePartURL.path)[.size] as? Int64) ?? 0
-            let sliceHeader = (try? FileHandle(forReadingFrom: resumePartURL).read(upToCount: 4)) ?? Data()
+            let finalSliceSize = (try? fm.attributesOfItem(atPath: resumeFinalURL.path)[.size] as? Int64) ?? 0
+            let sliceHeader = (try? FileHandle(forReadingFrom: resumeFinalURL).read(upToCount: 4)) ?? Data()
             try assertCondition(
                 didInjectMidStreamDrop && sizeAtDrop >= 524_288,
                 "Injected mid-stream disconnect during live Google Drive download at \(sizeAtDrop) bytes"
@@ -3143,7 +3144,7 @@ enum SelfTestRunner {
                 args: [
                     "x", "-y",
                     "-o\(extractedSliceDir.path)",
-                    resumePartURL.path,
+                    resumeFinalURL.path,
                     "Forza Horizon 2 [FitGirl Repack]/MD5/QuickSFV.EXE",
                     "Forza Horizon 2 [FitGirl Repack]/MD5/fitgirl-bins.md5"
                 ]
@@ -3156,7 +3157,7 @@ enum SelfTestRunner {
                 realQuickSFVSize == 103_424 && md5Content.contains("fg-01.bin") && md5Content.contains("fg-06.bin"),
                 "Extracted real MD5/QuickSFV.EXE (103,424 bytes) and MD5/fitgirl-bins.md5 from live Google Drive FH2-Game.zip"
             )
-            try? fm.removeItem(at: resumePartURL)
+            try? fm.removeItem(at: resumeFinalURL)
 
             // Also fetch the real `fg-06.bin` (offset 15,575,723,733..15,577,451,782) and `setup.exe` (offset 17,996,636,485..18,001,002,053) from Google Drive
             let fg06RangeURL = tempRoot.appendingPathComponent("fg06_entry.bin")
@@ -3359,7 +3360,9 @@ enum SelfTestRunner {
             )
 
             // Verify Step 4 results & launcher readiness
-            vm.refreshAllState()
+            vm.gameFolderPath = defaultGameDir.path
+            vm.validateGameFolder()
+            vm.refreshEnvironment()
             try assertCondition(
                 vm.isReadyToLaunch && vm.folderValidation.isVerified,
                 "LauncherViewModel isReadyToLaunch == true and folderValidation == .verified after 4-step pipeline"
