@@ -234,7 +234,45 @@ final class LauncherViewModel: ObservableObject {
     let defaultInstalledGameDirURL: URL
     private var cancellables = Set<AnyCancellable>()
     private var activeDownloadProcess: Process? = nil
+    private let sleepPreventionLock = NSLock()
+    private var setupActivityToken: NSObjectProtocol? = nil
+    private var caffeinateProcess: Process? = nil
     private var shouldCancelPipeline: Bool = false
+
+    func beginSetupSleepPrevention() {
+        sleepPreventionLock.lock()
+        defer { sleepPreventionLock.unlock() }
+        if setupActivityToken == nil {
+            setupActivityToken = ProcessInfo.processInfo.beginActivity(
+                options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled, .userInitiated, .suddenTerminationDisabled],
+                reason: "Forza Horizon 2 1-Click Setup & Download"
+            )
+        }
+        if caffeinateProcess == nil || caffeinateProcess?.isRunning == false {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+            proc.arguments = ["-dims", "-w", "\(ProcessInfo.processInfo.processIdentifier)"]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+            caffeinateProcess = proc
+        }
+    }
+
+    func endSetupSleepPrevention() {
+        sleepPreventionLock.lock()
+        defer { sleepPreventionLock.unlock() }
+        if let token = setupActivityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            setupActivityToken = nil
+        }
+        if let caff = caffeinateProcess {
+            if caff.isRunning {
+                caff.terminate()
+            }
+            caffeinateProcess = nil
+        }
+    }
 
     init() {
         let fm = FileManager.default
@@ -438,8 +476,8 @@ final class LauncherViewModel: ObservableObject {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
             p.arguments = ["-x", "oahd"]
-            p.standardOutput = Pipe()
-            p.standardError = Pipe()
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
             try? p.run()
             p.waitUntilExit()
             return p.terminationStatus == 0
@@ -678,42 +716,71 @@ final class LauncherViewModel: ObservableObject {
 
     // MARK: - Google Drive Large-File Confirmation Resolver & Auto-Resumable Downloader
 
+    static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15"
+
     /// Resolves Google Drive's large-file virus-scan confirmation page (`uuid` / `at` parameters)
-    /// into a direct binary stream URL (`https://drive.usercontent.google.com/download?...`).
-    static func resolveGoogleDriveDownloadURL(fileID: String) -> String {
+    /// into a direct binary stream URL (`https://drive.usercontent.google.com/download?...`),
+    /// persisting Google Drive session cookies in `cookieJarURL` when provided.
+    static func resolveGoogleDriveDownloadURL(fileID: String, cookieJarURL: URL? = nil) -> String {
         let fallbackURL = "https://drive.usercontent.google.com/download?id=\(fileID)&export=download&confirm=t"
         let ucURL = "https://drive.google.com/uc?export=download&id=\(fileID)"
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        proc.arguments = ["-sSL", "--connect-timeout", "15", "--max-time", "30", ucURL]
+        var args = ["-sSL", "--connect-timeout", "15", "--max-time", "30", "-A", safariUserAgent]
+        if let cookieJar = cookieJarURL {
+            try? FileManager.default.createDirectory(at: cookieJar.deletingLastPathComponent(), withIntermediateDirectories: true)
+            args += ["-c", cookieJar.path, "-b", cookieJar.path]
+        }
+        args.append(ucURL)
+        proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        proc.standardError = FileHandle.nullDevice
         do {
             try proc.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             proc.waitUntilExit()
-            guard let html = String(data: data, encoding: .utf8), html.contains("<form") else {
+            guard let html = String(data: data, encoding: .utf8), html.lowercased().contains("<form") else {
                 return fallbackURL
             }
 
-            // Extract action URL and hidden inputs (`id`, `export`, `confirm`, `uuid`, `at`)
+            // Extract form action URL regardless of attribute order or quote style
             var actionURL = "https://drive.usercontent.google.com/download"
-            if let actRegex = try? NSRegularExpression(pattern: #"action="([^"]+)""#),
-               let match = actRegex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
-               let r = Range(match.range(at: 1), in: html) {
-                actionURL = String(html[r]).replacingOccurrences(of: "&amp;", with: "&")
+            if let formRegex = try? NSRegularExpression(pattern: #"<form[^>]*>"#, options: [.caseInsensitive]),
+               let formMatch = formRegex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+               let formRange = Range(formMatch.range, in: html) {
+                let formTag = String(html[formRange])
+                if let actRegex = try? NSRegularExpression(pattern: #"action=["']([^"']+)["']"#, options: [.caseInsensitive]),
+                   let actMatch = actRegex.firstMatch(in: formTag, range: NSRange(formTag.startIndex..., in: formTag)),
+                   let r = Range(actMatch.range(at: 1), in: formTag) {
+                    actionURL = String(formTag[r]).replacingOccurrences(of: "&amp;", with: "&")
+                }
             }
 
+            // Extract <input> parameters regardless of attribute order (`name` before or after `value`/`type`)
             var params: [(String, String)] = []
-            if let inputRegex = try? NSRegularExpression(pattern: #"<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)""#) {
-                let matches = inputRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
-                for m in matches {
-                    if let nr = Range(m.range(at: 1), in: html),
-                       let vr = Range(m.range(at: 2), in: html) {
-                        params.append((String(html[nr]), String(html[vr])))
+            if let tagRegex = try? NSRegularExpression(pattern: #"<input[^>]*>"#, options: [.caseInsensitive]),
+               let nameRegex = try? NSRegularExpression(pattern: #"name=["']([^"']+)["']"#, options: [.caseInsensitive]),
+               let valRegex = try? NSRegularExpression(pattern: #"value=["']([^"']*)["']"#, options: [.caseInsensitive]) {
+                let tagMatches = tagRegex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+                for tm in tagMatches {
+                    guard let tagRange = Range(tm.range, in: html) else { continue }
+                    let tagStr = String(html[tagRange])
+                    let lowerTag = tagStr.lowercased()
+                    if lowerTag.contains("type=\"submit\"") || lowerTag.contains("type='submit'") {
+                        continue
                     }
+                    let nsRange = NSRange(tagStr.startIndex..., in: tagStr)
+                    guard let nm = nameRegex.firstMatch(in: tagStr, range: nsRange),
+                          let nr = Range(nm.range(at: 1), in: tagStr) else { continue }
+                    let name = String(tagStr[nr])
+                    var value = ""
+                    if let vm = valRegex.firstMatch(in: tagStr, range: nsRange),
+                       let vr = Range(vm.range(at: 1), in: tagStr) {
+                        value = String(tagStr[vr]).replacingOccurrences(of: "&amp;", with: "&")
+                    }
+                    params.append((name, value))
                 }
             }
 
@@ -742,7 +809,7 @@ final class LauncherViewModel: ObservableObject {
         ]
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        proc.standardError = FileHandle.nullDevice
         do {
             try proc.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -760,32 +827,141 @@ final class LauncherViewModel: ObservableObject {
         return manifest.runtimeFallbackURL
     }
 
-    /// Verifies that the resolved URL serves the expected binary header (`PK\x03\x04` for ZIP)
-    /// when probed with a 4-byte HTTP Range request.
-    static func probeURLReturnsZipMagic(_ urlString: String) -> Bool {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        proc.arguments = ["-sSL", "--connect-timeout", "15", "--max-time", "25", "--range", "0-3", urlString]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            return proc.terminationStatus == 0 && data.prefix(4) == Data([0x50, 0x4B, 0x03, 0x04])
-        } catch {
-            return false
-        }
+    enum ChunkValidationResult {
+        case valid
+        case invalid(String)
     }
 
-    /// Downloads a large file with `curl -L -C - --retry 999 --retry-delay 5 --retry-all-errors --connect-timeout 15`
-    /// inside an outer session-refresh retry loop so even if Wi-Fi drops for hours or Google Drive's `uuid` token expires,
-    /// it refreshes the URL and resumes from the exact byte offset on disk without ever restarting from 0%.
+    /// Verifies that a downloaded `.chunk` file and its `.hdr` response headers contain genuine binary
+    /// archive data (HTTP 206 Partial Content when `--range` was requested, non-`text/html`, `PK\x03\x04` at byte 0,
+    /// and never starting with `<!DOCTYPE` or `<html`).
+    static func validateDownloadedChunk(
+        chunkURL: URL,
+        hdrURL: URL,
+        startByte: Int64,
+        requireZipMagic: Bool,
+        usedRangeRequest: Bool,
+        isHTTP: Bool
+    ) -> ChunkValidationResult {
+        if isHTTP, let hdrText = try? String(contentsOf: hdrURL, encoding: .isoLatin1), !hdrText.isEmpty {
+            let lines = hdrText.components(separatedBy: CharacterSet.newlines)
+            var lastStatusLineIndex: Int? = nil
+            var lastStatusCode: Int? = nil
+            for (idx, rawLine) in lines.enumerated() {
+                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                if line.uppercased().hasPrefix("HTTP/") {
+                    lastStatusLineIndex = idx
+                    let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    if parts.count >= 2, let code = Int(parts[1]) {
+                        lastStatusCode = code
+                    }
+                }
+            }
+            if let statusIdx = lastStatusLineIndex, let code = lastStatusCode {
+                if !(300...399).contains(code) {
+                    if usedRangeRequest && code != 206 {
+                        return .invalid("Expected HTTP 206 Partial Content for range request, got HTTP \(code)")
+                    }
+                    if !usedRangeRequest && code != 200 && code != 206 {
+                        return .invalid("Unexpected HTTP status \(code)")
+                    }
+                    for rawLine in lines[statusIdx...] {
+                        let lower = rawLine.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        if lower.hasPrefix("content-type:") && lower.contains("text/html") {
+                            return .invalid("Server returned Content-Type: text/html")
+                        }
+                    }
+                }
+            }
+        }
+
+        guard let handle = try? FileHandle(forReadingFrom: chunkURL) else {
+            return .invalid("Unable to open chunk file for reading")
+        }
+        let prefixData = handle.readData(ofLength: 64)
+        try? handle.close()
+
+        guard !prefixData.isEmpty else {
+            return .invalid("Chunk file is empty")
+        }
+
+        if startByte == 0 && requireZipMagic {
+            if prefixData.count < 4 || prefixData.prefix(4) != Data([0x50, 0x4B, 0x03, 0x04]) {
+                return .invalid("Missing PK\\x03\\x04 ZIP magic header at byte 0")
+            }
+        }
+
+        let trimmedASCII = String(decoding: prefixData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if trimmedASCII.hasPrefix("<!doctype") ||
+           trimmedASCII.hasPrefix("<html") ||
+           trimmedASCII.hasPrefix("<head") ||
+           trimmedASCII.hasPrefix("<body") ||
+           trimmedASCII.hasPrefix("<title") ||
+           trimmedASCII.hasPrefix("<?xml") {
+            return .invalid("Chunk body starts with HTML/XML markup")
+        }
+
+        let isPureASCII = prefixData.allSatisfy { b in
+            b == 0x09 || b == 0x0A || b == 0x0D || (b >= 0x20 && b <= 0x7E)
+        }
+        if isPureASCII && trimmedASCII.hasPrefix("<") {
+            return .invalid("Chunk body starts with ASCII '<' tag")
+        }
+
+        return .valid
+    }
+
+    /// Stream-appends `sourceURL` onto `destinationURL` in 4 MiB buffers and deletes `sourceURL`.
+    @discardableResult
+    static func streamAppendFile(from sourceURL: URL, to destinationURL: URL, maxBytes: Int64? = nil) throws -> Int64 {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: destinationURL.path) {
+            fm.createFile(atPath: destinationURL.path, contents: nil)
+        }
+        let readHandle = try FileHandle(forReadingFrom: sourceURL)
+        defer { try? readHandle.close() }
+        let writeHandle = try FileHandle(forWritingTo: destinationURL)
+        defer { try? writeHandle.close() }
+        writeHandle.seekToEndOfFile()
+
+        let bufferSize = 4 * 1024 * 1024 // 4 MiB
+        var totalAppended: Int64 = 0
+        while true {
+            var shouldStop = false
+            try autoreleasepool {
+                var toRead = bufferSize
+                if let limit = maxBytes {
+                    let remaining = limit - totalAppended
+                    if remaining <= 0 {
+                        shouldStop = true
+                        return
+                    }
+                    toRead = Int(min(Int64(bufferSize), remaining))
+                }
+                let data = readHandle.readData(ofLength: toRead)
+                if data.isEmpty {
+                    shouldStop = true
+                    return
+                }
+                writeHandle.write(data)
+                totalAppended += Int64(data.count)
+            }
+            if shouldStop { break }
+        }
+        try? fm.removeItem(at: sourceURL)
+        return totalAppended
+    }
+
+    /// Downloads a large file using strictly append-only `.part` storage and verified temporary `.chunk` files
+    /// with bounded HTTP byte-range segments (`--range <start>-<end>`). `partFileURL` is never passed to `curl -o`,
+    /// guaranteeing that network drops or Google Drive HTML error pages can never truncate or overwrite saved progress.
     func downloadWithAutoResume(
         label: String,
         partFileURL: URL,
         finalFileURL: URL,
+        cookieJarURL: URL? = nil,
         expectedBytes: Int64,
         requireZipMagic: Bool,
         urlResolver: () -> String,
@@ -805,10 +981,19 @@ final class LauncherViewModel: ObservableObject {
             }
         }
 
+        let chunkURL = partFileURL.appendingPathExtension("chunk")
+        let hdrURL = partFileURL.appendingPathExtension("hdr")
+        let effectiveCookieJar = cookieJarURL ?? partFileURL.appendingPathExtension("cookies")
+
+        var segmentSize: Int64 = 134_217_728 // Start at 128 MiB bounded range windows
+        let minSegmentSize: Int64 = 1_048_576 // 1 MiB minimum adaptive window
+        var cachedResolvedURL: String? = nil
+        var smoothedSpeedMBps: Double = 0.0
+
         while !shouldCancelPipeline {
             var existingBytes = (try? fm.attributesOfItem(atPath: partFileURL.path)[.size] as? Int64) ?? 0
 
-            // Guard against a tiny corrupted HTML error stub in `.part`
+            // Verify existing `.part` starts with PK\x03\x04 when requireZipMagic is set
             if requireZipMagic && existingBytes > 0 {
                 if let handle = try? FileHandle(forReadingFrom: partFileURL) {
                     let magic = handle.readData(ofLength: 4)
@@ -821,43 +1006,70 @@ final class LauncherViewModel: ObservableObject {
                 }
             }
 
-            if requireZipMagic && existingBytes >= expectedBytes {
+            if requireZipMagic && expectedBytes > 0 && existingBytes >= expectedBytes {
                 break
             }
 
-            let resolvedURL = urlResolver()
-            if requireZipMagic && !Self.probeURLReturnsZipMagic(resolvedURL) {
-                appendLog("Waiting for network / valid Google Drive binary stream for \(label)...")
-                onInterrupted(existingBytes, expectedBytes)
-                Thread.sleep(forTimeInterval: 5.0)
-                continue
+            try? fm.removeItem(at: chunkURL)
+            try? fm.removeItem(at: hdrURL)
+
+            let resolvedURL: String
+            if let cached = cachedResolvedURL {
+                resolvedURL = cached
+            } else {
+                let fresh = urlResolver()
+                cachedResolvedURL = fresh
+                resolvedURL = fresh
             }
 
-            DispatchQueue.main.async {
-                self.connectionInterruptedBanner = nil
+            let isHTTP = resolvedURL.lowercased().hasPrefix("http://") || resolvedURL.lowercased().hasPrefix("https://")
+            let startByte = existingBytes
+            var endByte: Int64? = nil
+            var usedRangeRequest = false
+
+            if expectedBytes > 0 && requireZipMagic {
+                let computedEnd = min(expectedBytes - 1, startByte + segmentSize - 1)
+                endByte = computedEnd
+                usedRangeRequest = true
+            } else if startByte > 0 {
+                usedRangeRequest = true
             }
 
-            appendLog("Resuming \(label) from byte offset \(existingBytes) -> \(partFileURL.path)")
+            let expectedSegmentBytes: Int64? = endByte.map { $0 - startByte + 1 }
+
+            var curlArgs: [String] = [
+                "-sSL",
+                "--fail",
+                "--connect-timeout", "15",
+                "--speed-limit", "1024",
+                "--speed-time", "20",
+                "-A", Self.safariUserAgent,
+                "-D", hdrURL.path
+            ]
+            if isHTTP {
+                curlArgs += ["-c", effectiveCookieJar.path, "-b", effectiveCookieJar.path]
+            }
+            if let endByte = endByte {
+                curlArgs += ["--range", "\(startByte)-\(endByte)"]
+                appendLog("Requesting \(label) byte range \(startByte)-\(endByte) (\(segmentSize / 1_048_576) MiB window) -> \(chunkURL.lastPathComponent)")
+            } else if startByte > 0 {
+                curlArgs += ["--range", "\(startByte)-"]
+                appendLog("Resuming \(label) from byte offset \(startByte) -> \(chunkURL.lastPathComponent)")
+            } else {
+                appendLog("Starting \(label) download -> \(chunkURL.lastPathComponent)")
+            }
+            curlArgs += ["-o", chunkURL.path, resolvedURL]
 
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            proc.arguments = [
-                "-L",
-                "-C", "-",
-                "--fail",
-                "--retry", "999",
-                "--retry-delay", "5",
-                "--retry-all-errors",
-                "--connect-timeout", "15",
-                "-o", partFileURL.path,
-                resolvedURL
-            ]
-            proc.standardOutput = Pipe()
-            proc.standardError = Pipe()
+            proc.arguments = curlArgs
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
 
-            var lastSampleBytes = existingBytes
+            var chunkVerifiedBinary = false
+            var chunkInvalid = false
+            var lastSampleChunkBytes: Int64 = 0
             var lastSampleTime = Date()
-            var smoothedSpeedMBps: Double = 0.0
 
             do {
                 try proc.run()
@@ -866,47 +1078,147 @@ final class LauncherViewModel: ObservableObject {
                 while proc.isRunning && !shouldCancelPipeline {
                     Thread.sleep(forTimeInterval: 0.5)
                     let now = Date()
-                    let currentBytes = (try? fm.attributesOfItem(atPath: partFileURL.path)[.size] as? Int64) ?? existingBytes
-                    let dt = now.timeIntervalSince(lastSampleTime)
-                    if dt >= 0.45 {
-                        let delta = max(0, currentBytes - lastSampleBytes)
-                        let instantMBps = (Double(delta) / 1_048_576.0) / dt
-                        if instantMBps > 0 {
-                            smoothedSpeedMBps = (smoothedSpeedMBps == 0) ? instantMBps : (smoothedSpeedMBps * 0.65 + instantMBps * 0.35)
+                    let chunkBytes = (try? fm.attributesOfItem(atPath: chunkURL.path)[.size] as? Int64) ?? 0
+
+                    if chunkBytes >= 4 {
+                        let check = Self.validateDownloadedChunk(
+                            chunkURL: chunkURL,
+                            hdrURL: hdrURL,
+                            startByte: startByte,
+                            requireZipMagic: requireZipMagic,
+                            usedRangeRequest: usedRangeRequest,
+                            isHTTP: isHTTP
+                        )
+                        switch check {
+                        case .valid:
+                            chunkVerifiedBinary = true
+                        case .invalid(let reason):
+                            appendLog("Rejected non-binary/HTML chunk for \(label) at offset \(startByte): \(reason)")
+                            chunkInvalid = true
+                            chunkVerifiedBinary = false
+                            proc.terminate()
+                            try? fm.removeItem(at: chunkURL)
                         }
-                        lastSampleBytes = currentBytes
-                        lastSampleTime = now
-                        onProgress(currentBytes, expectedBytes, smoothedSpeedMBps)
+                    }
+
+                    if chunkInvalid {
+                        break
+                    }
+
+                    if chunkVerifiedBinary {
+                        if self.connectionInterruptedBanner != nil {
+                            self.setConnectionInterrupted(nil)
+                        }
+                        let dt = now.timeIntervalSince(lastSampleTime)
+                        if dt >= 0.45 {
+                            let delta = max(0, chunkBytes - lastSampleChunkBytes)
+                            let instantMBps = (Double(delta) / 1_048_576.0) / dt
+                            if instantMBps > 0 {
+                                smoothedSpeedMBps = (smoothedSpeedMBps == 0) ? instantMBps : (smoothedSpeedMBps * 0.65 + instantMBps * 0.35)
+                            }
+                            lastSampleChunkBytes = chunkBytes
+                            lastSampleTime = now
+                            onProgress(existingBytes + chunkBytes, expectedBytes, smoothedSpeedMBps)
+                        }
                     }
                 }
 
-                if shouldCancelPipeline {
-                    if proc.isRunning { proc.terminate() }
-                    throw NSError(domain: "FH2Setup", code: -999, userInfo: [NSLocalizedDescriptionKey: "Setup paused by user."])
+                if shouldCancelPipeline && proc.isRunning {
+                    proc.terminate()
                 }
 
                 proc.waitUntilExit()
                 self.activeDownloadProcess = nil
             } catch {
                 self.activeDownloadProcess = nil
-                if shouldCancelPipeline { throw error }
             }
 
-            let postBytes = (try? fm.attributesOfItem(atPath: partFileURL.path)[.size] as? Int64) ?? 0
-            if proc.terminationStatus == 0 && (!requireZipMagic || postBytes >= expectedBytes) && postBytes > 0 {
-                onProgress(postBytes, max(expectedBytes, postBytes), smoothedSpeedMBps)
-                break
+            // Validate and stream-append any verified bytes downloaded before exit (even if interrupted or paused)
+            let finalChunkBytes = (try? fm.attributesOfItem(atPath: chunkURL.path)[.size] as? Int64) ?? 0
+            if !chunkInvalid && finalChunkBytes > 0 {
+                let minBytesRequired: Int64 = {
+                    if let expSeg = expectedSegmentBytes, expSeg < 4 {
+                        return expSeg
+                    }
+                    return 4
+                }()
+                if finalChunkBytes >= minBytesRequired {
+                    let postCheck = Self.validateDownloadedChunk(
+                        chunkURL: chunkURL,
+                        hdrURL: hdrURL,
+                        startByte: startByte,
+                        requireZipMagic: requireZipMagic,
+                        usedRangeRequest: usedRangeRequest,
+                        isHTTP: isHTTP
+                    )
+                    switch postCheck {
+                    case .valid:
+                        chunkVerifiedBinary = true
+                    case .invalid(let reason):
+                        appendLog("Rejected post-exit chunk for \(label) at offset \(startByte): \(reason)")
+                        chunkInvalid = true
+                        chunkVerifiedBinary = false
+                    }
+                } else {
+                    chunkVerifiedBinary = false
+                }
             }
+
+            var appendedBytes: Int64 = 0
+            if chunkVerifiedBinary && !chunkInvalid && finalChunkBytes > 0 {
+                appendedBytes = (try? Self.streamAppendFile(
+                    from: chunkURL,
+                    to: partFileURL,
+                    maxBytes: expectedSegmentBytes
+                )) ?? 0
+                if appendedBytes > 0 {
+                    if self.connectionInterruptedBanner != nil {
+                        self.setConnectionInterrupted(nil)
+                    }
+                    onProgress(existingBytes + appendedBytes, expectedBytes, smoothedSpeedMBps)
+                }
+            }
+            try? fm.removeItem(at: chunkURL)
+            try? fm.removeItem(at: hdrURL)
 
             if shouldCancelPipeline {
                 throw NSError(domain: "FH2Setup", code: -999, userInfo: [NSLocalizedDescriptionKey: "Setup paused by user."])
             }
 
-            appendLog("Download stream interrupted at \(postBytes) bytes (exit \(proc.terminationStatus)). Refreshing session & auto-resuming in 5s...")
+            let postBytes = (try? fm.attributesOfItem(atPath: partFileURL.path)[.size] as? Int64) ?? 0
+
+            if requireZipMagic {
+                if postBytes >= expectedBytes && postBytes > 0 {
+                    onProgress(postBytes, max(expectedBytes, postBytes), smoothedSpeedMBps)
+                    break
+                }
+                // If this bounded range segment completed cleanly, immediately advance to the next segment
+                if !chunkInvalid && proc.terminationStatus == 0 && appendedBytes > 0 {
+                    continue
+                }
+            } else {
+                if !chunkInvalid && proc.terminationStatus == 0 && (postBytes >= expectedBytes || postBytes > 100_000_000) && postBytes > 0 {
+                    onProgress(postBytes, max(expectedBytes, postBytes), smoothedSpeedMBps)
+                    break
+                }
+            }
+
+            // Stream was interrupted or Google Drive returned an HTML page instead of HTTP 206 binary data
+            cachedResolvedURL = nil
+            if chunkInvalid && requireZipMagic && expectedBytes > 0 && segmentSize > minSegmentSize {
+                let nextSize: Int64 = (segmentSize == 4 * 1_048_576) ? 1_048_576 : max(minSegmentSize, segmentSize / 2)
+                appendLog("Adaptively halving bounded range segment size from \(segmentSize / 1_048_576) MiB to \(nextSize / 1_048_576) MiB")
+                segmentSize = nextSize
+            }
+
+            appendLog("Download stream interrupted at \(postBytes) bytes (exit \(proc.terminationStatus), invalid=\(chunkInvalid)). Refreshing session & auto-resuming in 5s...")
             onInterrupted(postBytes, expectedBytes)
             Thread.sleep(forTimeInterval: 5.0)
         }
 
+        try? fm.removeItem(at: chunkURL)
+        try? fm.removeItem(at: hdrURL)
+        try? fm.removeItem(at: effectiveCookieJar)
         try? fm.removeItem(at: finalFileURL)
         try fm.moveItem(at: partFileURL, to: finalFileURL)
         appendLog("Completed download: \(finalFileURL.path)")
@@ -921,12 +1233,14 @@ final class LauncherViewModel: ObservableObject {
         isSetupPausedOrInterrupted = false
         errorBannerText = nil
         connectionInterruptedBanner = nil
+        beginSetupSleepPrevention()
         appendLog("=== Starting 1-Click A-to-Z Setup & Download Pipeline ===")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             do {
                 try self.executeFourStepSetupPipeline()
+                self.endSetupSleepPrevention()
                 DispatchQueue.main.async {
                     self.isRunningSetupPipeline = false
                     self.isSetupPausedOrInterrupted = false
@@ -935,6 +1249,7 @@ final class LauncherViewModel: ObservableObject {
                     self.launchStatusText = "All 4 setup steps complete! Ready to launch Forza Horizon 2."
                 }
             } catch {
+                self.endSetupSleepPrevention()
                 let nsErr = error as NSError
                 self.appendLog("Setup pipeline stopped: \(error.localizedDescription)")
                 DispatchQueue.main.async {
@@ -953,6 +1268,7 @@ final class LauncherViewModel: ObservableObject {
         guard isRunningSetupPipeline else { return }
         shouldCancelPipeline = true
         activeDownloadProcess?.terminate()
+        endSetupSleepPrevention()
         appendLog("User requested pause — saving download progress on disk.")
     }
 
@@ -966,6 +1282,11 @@ final class LauncherViewModel: ObservableObject {
         customGameExpectedBytes: Int64? = nil,
         customUnpackedTargetBytes: Int64? = nil
     ) throws {
+        beginSetupSleepPrevention()
+        defer {
+            endSetupSleepPrevention()
+        }
+
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser
         let workCacheDir = customCacheDir ?? cacheDirURL
@@ -1066,18 +1387,28 @@ final class LauncherViewModel: ObservableObject {
 
         let gameZipPartURL = workCacheDir.appendingPathComponent("\(manifest.gameFilename).part")
         let gameZipFinalURL = workCacheDir.appendingPathComponent(manifest.gameFilename)
+        let gameCookieJarURL = workCacheDir.appendingPathComponent("gdrive_cookies.txt")
 
         if !gameAlreadyVerified && !fm.fileExists(atPath: fgSetupDir.appendingPathComponent("setup.exe").path) {
-            updateStep2(.active(progress: 0.01, detail: "Resolving Google Drive cloud download stream..."))
+            let existingPartBytes = (try? fm.attributesOfItem(atPath: gameZipPartURL.path)[.size] as? Int64) ?? 0
+            if existingPartBytes > 0 {
+                let pct = min(0.99, max(0.01, Double(existingPartBytes) / Double(max(1, expectedZipBytes))))
+                let curGB = Double(existingPartBytes) / 1_000_000_000.0
+                let expGB = Double(expectedZipBytes) / 1_000_000_000.0
+                updateStep2(.active(progress: pct, detail: String(format: "Resuming from %.2f GB / %.2f GB (%.0f%%)...", curGB, expGB, pct * 100.0)))
+            } else {
+                updateStep2(.active(progress: 0.01, detail: "Resolving Google Drive cloud download stream..."))
+            }
 
             try downloadWithAutoResume(
                 label: manifest.gameFilename,
                 partFileURL: gameZipPartURL,
                 finalFileURL: gameZipFinalURL,
+                cookieJarURL: gameCookieJarURL,
                 expectedBytes: expectedZipBytes,
                 requireZipMagic: true,
                 urlResolver: customGameZipURLResolver ?? {
-                    Self.resolveGoogleDriveDownloadURL(fileID: self.manifest.gameFileID)
+                    Self.resolveGoogleDriveDownloadURL(fileID: self.manifest.gameFileID, cookieJarURL: gameCookieJarURL)
                 },
                 onProgress: { cur, exp, speed in
                     let pct = min(1.0, max(0.0, Double(cur) / Double(max(1, exp))))
@@ -1093,7 +1424,7 @@ final class LauncherViewModel: ObservableObject {
                     let pct = min(0.99, max(0.0, Double(cur) / Double(max(1, exp))))
                     let curGB = Double(cur) / 1_000_000_000.0
                     let msg = String(
-                        format: "Connection interrupted — waiting for internet to resume from %.1f GB (%.0f%%)...",
+                        format: "Connection interrupted — waiting for internet to resume from %.2f GB (%.0f%%)...",
                         curGB, pct * 100.0
                     )
                     self.setConnectionInterrupted(msg)
@@ -1205,8 +1536,8 @@ final class LauncherViewModel: ObservableObject {
             setupProc.currentDirectoryURL = fgSetupDir
             setupProc.arguments = setupArgs
             setupProc.environment = wineEnv
-            setupProc.standardOutput = Pipe()
-            setupProc.standardError = Pipe()
+            setupProc.standardOutput = FileHandle.nullDevice
+            setupProc.standardError = FileHandle.nullDevice
 
             try setupProc.run()
             let targetUnpackedBytes = customUnpackedTargetBytes ?? manifest.gameUnpackedTargetBytes
@@ -1297,7 +1628,7 @@ final class LauncherViewModel: ObservableObject {
         proc.arguments = ["-sk", url.path]
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        proc.standardError = FileHandle.nullDevice
         do {
             try proc.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -2398,7 +2729,11 @@ enum SelfTestRunner {
             )
 
             // 2. Verify Google Drive Large-File Confirmation Resolver & Byte-Range Auto-Resume (First 1 MB + Next 1 MB)
-            let resolvedDriveURL = LauncherViewModel.resolveGoogleDriveDownloadURL(fileID: manifest.gameFileID)
+            let selftestCookieJar = tempRoot.appendingPathComponent("selftest_gdrive_cookies.txt")
+            let resolvedDriveURL = LauncherViewModel.resolveGoogleDriveDownloadURL(
+                fileID: manifest.gameFileID,
+                cookieJarURL: selftestCookieJar
+            )
             try assertCondition(
                 resolvedDriveURL.contains("drive.usercontent.google.com/download") && resolvedDriveURL.contains(manifest.gameFileID),
                 "Google Drive confirmation resolver resolved URL: \(resolvedDriveURL)"
@@ -2410,7 +2745,16 @@ enum SelfTestRunner {
             // Download first 1 MB (bytes 0..1048575)
             let (c1Code, _) = vm.runProcess(
                 executable: "/usr/bin/curl",
-                args: ["-fsSL", "--retry", "3", "--range", "0-1048575", "-o", drivePartTest.path, resolvedDriveURL]
+                args: [
+                    "-fsSL",
+                    "--retry", "3",
+                    "-A", LauncherViewModel.safariUserAgent,
+                    "-c", selftestCookieJar.path,
+                    "-b", selftestCookieJar.path,
+                    "--range", "0-1048575",
+                    "-o", drivePartTest.path,
+                    resolvedDriveURL
+                ]
             )
             let firstMBData = (try? Data(contentsOf: drivePartTest)) ?? Data()
             try assertCondition(
@@ -2420,10 +2764,22 @@ enum SelfTestRunner {
 
             // Verify byte-exact range resume (bytes 1048576..2097151) for the next 1 MB
             let driveChunk2 = tempRoot.appendingPathComponent("fh2_drive_chunk2.bin")
-            let resolvedDriveURL2 = LauncherViewModel.resolveGoogleDriveDownloadURL(fileID: manifest.gameFileID)
+            let resolvedDriveURL2 = LauncherViewModel.resolveGoogleDriveDownloadURL(
+                fileID: manifest.gameFileID,
+                cookieJarURL: selftestCookieJar
+            )
             let (c2Code, _) = vm.runProcess(
                 executable: "/usr/bin/curl",
-                args: ["-fsSL", "--retry", "3", "--range", "1048576-2097151", "-o", driveChunk2.path, resolvedDriveURL2]
+                args: [
+                    "-fsSL",
+                    "--retry", "3",
+                    "-A", LauncherViewModel.safariUserAgent,
+                    "-c", selftestCookieJar.path,
+                    "-b", selftestCookieJar.path,
+                    "--range", "1048576-2097151",
+                    "-o", driveChunk2.path,
+                    resolvedDriveURL2
+                ]
             )
             if let chunk2Data = try? Data(contentsOf: driveChunk2), let handle = try? FileHandle(forWritingTo: drivePartTest) {
                 handle.seekToEndOfFile()
@@ -2461,7 +2817,7 @@ enum SelfTestRunner {
                 try assertCondition(bitmap.pixelsWide >= 740 && bitmap.pixelsHigh >= 560, "Rendered live 740x560 SwiftUI LauncherMainView to bitmap (\(bitmap.pixelsWide)x\(bitmap.pixelsHigh) px)")
             }
 
-            // 4. Verify Complete 4-Step A-to-Z Pipeline End-to-End (7zz Extraction, Bracket-Free Flattening, QuickSFV Neutralization, winxp64 -> setup.exe -> win10, Azimuth Setup)
+            // 4. Verify Complete 4-Step A-to-Z Pipeline End-to-End (HTML Quota-Error Protection, 50%->100% Append-Only Resume, 7zz Extraction, QuickSFV Neutralization, winxp64 -> setup.exe -> win10, Azimuth Setup)
             let mockRepackSrc = tempRoot.appendingPathComponent("Forza Horizon 2 [FitGirl Repack]")
             try fm.createDirectory(at: mockRepackSrc.appendingPathComponent("MD5"), withIntermediateDirectories: true)
             try fm.createDirectory(at: mockRepackSrc.appendingPathComponent("_Redist"), withIntermediateDirectories: true)
@@ -2521,22 +2877,55 @@ enum SelfTestRunner {
             let testBottle = tempRoot.appendingPathComponent("bottle")
             let testFinalGameDir = tempRoot.appendingPathComponent("Games/Forza Horizon 2")
 
-            // Pre-seed 50% of `FH2-Game.zip.part` on disk to verify `downloadWithAutoResume` (`curl -L -C -`) resumes from 50% -> 100%
+            // Pre-seed 50% of `FH2-Game.zip.part` on disk
             try fm.createDirectory(at: testCacheDir, withIntermediateDirectories: true)
             let fullMockData = try Data(contentsOf: mockGameZip)
             let halfCount = max(4, fullMockData.count / 2)
-            try fullMockData.prefix(halfCount).write(to: testCacheDir.appendingPathComponent("FH2-Game.zip.part"))
+            let expectedHalfPrefix = Data(fullMockData.prefix(halfCount))
+            let seededPartURL = testCacheDir.appendingPathComponent("FH2-Game.zip.part")
+            try expectedHalfPrefix.write(to: seededPartURL)
+
+            // Create a mock HTML error file (`<!DOCTYPE html><html><head><title>Google Drive - Quota exceeded</title></head></html>`)
+            // aligned so that both byte 0 and byte `halfCount` start with `<!DOCTYPE html...` when read via `file://` range request.
+            let htmlSnippet = Data("<!DOCTYPE html><html><head><title>Google Drive - Quota exceeded</title></head></html>\n".utf8)
+            var htmlErrorData = Data()
+            while htmlErrorData.count < halfCount {
+                let rem = halfCount - htmlErrorData.count
+                htmlErrorData.append(htmlSnippet.prefix(rem))
+            }
+            while htmlErrorData.count < Int(mockZipSize) + 256 {
+                htmlErrorData.append(htmlSnippet)
+            }
+            let quotaErrorHTMLURL = tempRoot.appendingPathComponent("gdrive_quota_error.html")
+            try htmlErrorData.write(to: quotaErrorHTMLURL)
+
+            var resolverAttempt = 0
+            var partSizeAfterAttempt1: Int64 = -1
+            var partDataAfterAttempt1 = Data()
 
             try vm.executeFourStepSetupPipeline(
                 customCacheDir: testCacheDir,
                 customBottleURL: testBottle,
                 customGameDestDir: testFinalGameDir,
                 mockRuntimeEnv: mockEnv,
-                customGameZipURLResolver: { "file://\(mockGameZip.path)" },
+                customGameZipURLResolver: {
+                    resolverAttempt += 1
+                    if resolverAttempt == 1 {
+                        return "file://\(quotaErrorHTMLURL.path)"
+                    } else {
+                        partSizeAfterAttempt1 = (try? fm.attributesOfItem(atPath: seededPartURL.path)[.size] as? Int64) ?? -1
+                        partDataAfterAttempt1 = (try? Data(contentsOf: seededPartURL)) ?? Data()
+                        return "file://\(mockGameZip.path)"
+                    }
+                },
                 customGameExpectedBytes: mockZipSize,
                 customUnpackedTargetBytes: 4096
             )
 
+            try assertCondition(
+                resolverAttempt >= 2 && partSizeAfterAttempt1 == Int64(halfCount) && partDataAfterAttempt1 == expectedHalfPrefix,
+                "Attempt 1 HTML Quota-Exceeded page was rejected without deleting or corrupting 50% FH2-Game.zip.part (\(partSizeAfterAttempt1) bytes intact), and Attempt 2 resumed from 50% -> 100%"
+            )
             try assertCondition(
                 fm.fileExists(atPath: testFinalGameDir.appendingPathComponent("Mount/forza_durango_release_final.exe").path),
                 "4-Step pipeline unpacked forza_durango_release_final.exe into final game folder"
