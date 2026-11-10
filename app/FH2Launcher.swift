@@ -3,7 +3,7 @@
 // Zero Homebrew, Zero Xcode Command Line Tools required:
 //   Step 1: Rosetta 2 + Direct Download of Game Porting Toolkit (Wine64 + Apple Signed D3DMetal)
 //   Step 2: Bulletproof Auto-Resumable 16.8 GiB Cloud Download (FH2-Game.zip from Google Drive)
-//   Step 3: Bundled 7zz Extraction + Silent Repack Unpacking (winxp64, QuickSFV neutralized, auto-cleanup)
+//   Step 3: Bundled 7zz Extraction + Silent Repack Unpacking (win7 w/ win10 fallback, QuickSFV neutralized, auto-cleanup)
 //   Step 4: Azimuth (0.9.10 / 1.0.1) + d3d12.dll + fh2pad.dll + d3dcompiler_47.dll + ExtraOptions + UTF-16LE azimuth.ini
 
 import SwiftUI
@@ -1553,7 +1553,7 @@ final class LauncherViewModel: ObservableObject {
             }
 
             // 3b. Neutralize `_Redist/QuickSFV.exe` and `MD5/QuickSFV.EXE` (case-insensitive recursive scan)
-            updateStep3(.active(progress: 0.14, detail: "Neutralizing QuickSFV post-install MD5 check & configuring winxp64..."))
+            updateStep3(.active(progress: 0.14, detail: "Neutralizing QuickSFV post-install MD5 check & configuring Windows 7 mode..."))
             let noopExeURL = Bundle.main.resourceURL?.appendingPathComponent("payload/layer/noop.exe")
             if let enumerator = fm.enumerator(at: fgSetupDir, includingPropertiesForKeys: nil) {
                 for case let fileURL as URL in enumerator {
@@ -1569,8 +1569,11 @@ final class LauncherViewModel: ObservableObject {
                 }
             }
 
-            // 3c. Bootstrap bottle if needed and set Windows version to `winxp64` for FreeArc/LOLZ/XTool stability
-            let wineEnv = buildWineEnvironment(for: activeEnv, bottleURL: bottleURL, useMetalHUD: false)
+            // 3c. Bootstrap bottle if needed and set Windows version to `win7`.
+            // NOTE: Do NOT use `winxp64` here — FitGirl repacks are built with Inno Setup 6.3+, which requires
+            // Windows 7 or later and immediately aborts with exit code 1 ("Setup failed to initialize") on XP/Vista.
+            var wineEnv = buildWineEnvironment(for: activeEnv, bottleURL: bottleURL, useMetalHUD: false)
+            wineEnv["WINEDEBUG"] = "err+all,fixme-all"
             guard let wineBin = activeEnv.wineExecutable else {
                 throw NSError(domain: "FH2Setup", code: 22, userInfo: [NSLocalizedDescriptionKey: "Wine executable missing."])
             }
@@ -1584,54 +1587,119 @@ final class LauncherViewModel: ObservableObject {
 
             let setupAppKey = #"HKCU\Software\Wine\AppDefaults\setup.exe"#
             let globalWineKey = #"HKCU\Software\Wine"#
-            _ = runProcess(executable: wineBin.path, args: ["reg", "add", setupAppKey, "/v", "Version", "/t", "REG_SZ", "/d", "winxp64", "/f"], env: wineEnv)
-            _ = runProcess(executable: wineBin.path, args: ["reg", "add", globalWineKey, "/v", "Version", "/t", "REG_SZ", "/d", "winxp64", "/f"], env: wineEnv)
-
-            // 3d. Run `setup.exe` silently into `C:\FH2Game` while polling disk usage (`du -sk`) every 2 seconds
-            let bottleGameDir = driveCURL.appendingPathComponent("FH2Game")
-            try fm.createDirectory(at: bottleGameDir, withIntermediateDirectories: true)
-
-            var setupArgs = [#"C:\fg_setup\setup.exe"#]
-            if !showInstallerWindow {
-                setupArgs += ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL"]
-            }
-            setupArgs.append(#"/DIR=C:\FH2Game"#)
-
-            appendLog("Launching installer: \(wineBin.path) \(setupArgs.joined(separator: " "))")
-            let setupProc = Process()
-            setupProc.executableURL = wineBin
-            setupProc.currentDirectoryURL = fgSetupDir
-            setupProc.arguments = setupArgs
-            setupProc.environment = wineEnv
-            setupProc.standardOutput = FileHandle.nullDevice
-            setupProc.standardError = FileHandle.nullDevice
-
-            try setupProc.run()
             let targetUnpackedBytes = customUnpackedTargetBytes ?? manifest.gameUnpackedTargetBytes
 
-            while setupProc.isRunning && !shouldCancelPipeline {
-                Thread.sleep(forTimeInterval: 2.0)
-                // Belt-and-suspenders: terminate any QuickSFV.exe process if spawned
-                _ = runProcess(executable: "/usr/bin/pkill", args: ["-fi", "QuickSFV.exe"])
-
-                let currentUnpackedBytes = Self.directorySizeBytesViaDu(at: bottleGameDir)
-                let ratio = min(0.98, max(0.0, Double(currentUnpackedBytes) / Double(max(1, targetUnpackedBytes))))
-                let uiProgress = 0.15 + ratio * 0.80
-                let curGB = Double(currentUnpackedBytes) / 1_000_000_000.0
-                let targetGB = Double(targetUnpackedBytes) / 1_000_000_000.0
-                let detail = String(
-                    format: "Step 3/4: Installing & decompressing game files (%.1f GB / %.1f GB — %.0f%%)...",
-                    curGB, targetGB, ratio * 100.0
-                )
-                updateStep3(.active(progress: uiProgress, detail: detail))
+            // 3d. Pre-flight free disk space check (installer needs ~40 GB + headroom on the bottle's volume)
+            let bottleGameDir = driveCURL.appendingPathComponent("FH2Game")
+            try fm.createDirectory(at: bottleGameDir, withIntermediateDirectories: true)
+            let alreadyUnpacked = Self.directorySizeBytesViaDu(at: bottleGameDir)
+            if let freeBytes = Self.volumeFreeBytes(at: driveCURL) {
+                let requiredBytes = max(0, targetUnpackedBytes - alreadyUnpacked) + 3_000_000_000
+                appendLog(String(format: "Free disk space: %.1f GB (need ~%.1f GB)", Double(freeBytes) / 1e9, Double(requiredBytes) / 1e9))
+                if freeBytes < requiredBytes {
+                    throw NSError(domain: "FH2Setup", code: 26, userInfo: [
+                        NSLocalizedDescriptionKey: String(
+                            format: "Not enough disk space to unpack the game: %.1f GB free, ~%.1f GB needed. Free up space and click Resume.",
+                            Double(freeBytes) / 1e9, Double(requiredBytes) / 1e9
+                        )
+                    ])
+                }
             }
 
-            if shouldCancelPipeline {
-                if setupProc.isRunning { setupProc.terminate() }
-                throw NSError(domain: "FH2Setup", code: -999, userInfo: [NSLocalizedDescriptionKey: "Setup paused by user."])
-            }
+            // 3e. Run `setup.exe` into `C:\FH2Game` while polling disk usage (`du -sk`) every 2 seconds.
+            // If it fails quickly under win7, retry once under win10 before giving up.
+            let logsDir = logFileURL.deletingLastPathComponent()
+            try? fm.createDirectory(at: logsDir, withIntermediateDirectories: true)
+            let wineOutputLogURL = logsDir.appendingPathComponent("setup_wine.log")
+            let innoLogURL = driveCURL.appendingPathComponent("fh2_setup.log")
 
-            setupProc.waitUntilExit()
+            var lastExitCode: Int32 = 0
+            let windowsVersionsToTry = ["win7", "win10"]
+            for (attemptIndex, winVersion) in windowsVersionsToTry.enumerated() {
+                _ = runProcess(executable: wineBin.path, args: ["reg", "add", setupAppKey, "/v", "Version", "/t", "REG_SZ", "/d", winVersion, "/f"], env: wineEnv)
+                _ = runProcess(executable: wineBin.path, args: ["reg", "add", globalWineKey, "/v", "Version", "/t", "REG_SZ", "/d", winVersion, "/f"], env: wineEnv)
+
+                var setupArgs = [#"C:\fg_setup\setup.exe"#]
+                if !showInstallerWindow {
+                    setupArgs += ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL"]
+                }
+                setupArgs.append(#"/DIR=C:\FH2Game"#)
+                setupArgs.append(#"/LOG=C:\fh2_setup.log"#)
+
+                appendLog("Launching installer (attempt \(attemptIndex + 1), Windows version \(winVersion)): \(wineBin.path) \(setupArgs.joined(separator: " "))")
+                try? fm.removeItem(at: innoLogURL)
+                fm.createFile(atPath: wineOutputLogURL.path, contents: nil)
+                let wineOutputHandle = try? FileHandle(forWritingTo: wineOutputLogURL)
+
+                let setupProc = Process()
+                setupProc.executableURL = wineBin
+                setupProc.currentDirectoryURL = fgSetupDir
+                setupProc.arguments = setupArgs
+                setupProc.environment = wineEnv
+                setupProc.standardOutput = wineOutputHandle ?? FileHandle.nullDevice
+                setupProc.standardError = wineOutputHandle ?? FileHandle.nullDevice
+
+                let startedAt = Date()
+                try setupProc.run()
+
+                while setupProc.isRunning && !shouldCancelPipeline {
+                    Thread.sleep(forTimeInterval: 2.0)
+                    // Belt-and-suspenders: terminate any QuickSFV.exe process if spawned
+                    _ = runProcess(executable: "/usr/bin/pkill", args: ["-fi", "QuickSFV.exe"])
+
+                    let currentUnpackedBytes = Self.directorySizeBytesViaDu(at: bottleGameDir)
+                    let ratio = min(0.98, max(0.0, Double(currentUnpackedBytes) / Double(max(1, targetUnpackedBytes))))
+                    let uiProgress = 0.15 + ratio * 0.80
+                    let curGB = Double(currentUnpackedBytes) / 1_000_000_000.0
+                    let targetGB = Double(targetUnpackedBytes) / 1_000_000_000.0
+                    let detail = String(
+                        format: "Step 3/4: Installing & decompressing game files (%.1f GB / %.1f GB — %.0f%%)...",
+                        curGB, targetGB, ratio * 100.0
+                    )
+                    updateStep3(.active(progress: uiProgress, detail: detail))
+                }
+
+                if shouldCancelPipeline {
+                    if setupProc.isRunning { setupProc.terminate() }
+                    try? wineOutputHandle?.close()
+                    throw NSError(domain: "FH2Setup", code: -999, userInfo: [NSLocalizedDescriptionKey: "Setup paused by user."])
+                }
+
+                setupProc.waitUntilExit()
+                // Wait for any child unpacker processes (unarc/xtool) spawned by the installer to finish
+                if let srv = activeEnv.wineserverExecutable {
+                    _ = runProcess(executable: srv.path, args: ["-w"], env: wineEnv)
+                }
+                try? wineOutputHandle?.close()
+                lastExitCode = setupProc.terminationStatus
+                let elapsed = Date().timeIntervalSince(startedAt)
+                appendLog(String(format: "Installer exited with code %d after %.0f s (Windows version %@).", lastExitCode, elapsed, winVersion))
+
+                // Copy the Inno Setup log next to launcher.log so users can share it
+                if fm.fileExists(atPath: innoLogURL.path) {
+                    let dest = logsDir.appendingPathComponent("fh2_setup_\(winVersion).log")
+                    try? fm.removeItem(at: dest)
+                    try? fm.copyItem(at: innoLogURL, to: dest)
+                }
+
+                if Self.checkGameFolderValid(at: bottleGameDir) { break }
+
+                // Log the tail of the installer logs to help diagnose the failure
+                let innoTail = Self.tailOfFile(innoLogURL, maxLines: 15)
+                let wineTail = Self.tailOfFile(wineOutputLogURL, maxLines: 15)
+                if !innoTail.isEmpty { appendLog("Inno Setup log (tail):\n\(innoTail)") }
+                if !wineTail.isEmpty { appendLog("Wine output (tail):\n\(wineTail)") }
+
+                // Only retry when the installer bailed out early (not after a long, real decompression failure)
+                let unpackedNow = Self.directorySizeBytesViaDu(at: bottleGameDir)
+                let failedEarly = elapsed < 300 || unpackedNow < 1_000_000_000
+                if attemptIndex < windowsVersionsToTry.count - 1 && failedEarly {
+                    appendLog("Installer failed early — retrying with a different Windows version...")
+                    updateStep3(.active(progress: 0.15, detail: "Installer failed to start under \(winVersion) — retrying..."))
+                    continue
+                }
+                break
+            }
 
             // Restore Wine bottle Windows version back to `win10`
             _ = runProcess(executable: wineBin.path, args: ["reg", "delete", setupAppKey, "/v", "Version", "/f"], env: wineEnv)
@@ -1639,7 +1707,7 @@ final class LauncherViewModel: ObservableObject {
 
             guard Self.checkGameFolderValid(at: bottleGameDir) else {
                 throw NSError(domain: "FH2Setup", code: 25, userInfo: [
-                    NSLocalizedDescriptionKey: "Unpacking finished (exit \(setupProc.terminationStatus)), but forza_durango_release_final.exe was not found in C:\\FH2Game."
+                    NSLocalizedDescriptionKey: "Unpacking finished (exit \(lastExitCode)), but forza_durango_release_final.exe was not found in C:\\FH2Game. See ~/Library/Logs/FH2Port/ (launcher.log, setup_wine.log, fh2_setup_*.log). Try enabling 'Show Installer Window' and click Resume to see the installer's error."
                 ])
             }
 
@@ -1686,6 +1754,24 @@ final class LauncherViewModel: ObservableObject {
         )
 
         updateStep4(.completed(detail: "Azimuth \(azimuthBuild.rawValue) + D3D12 + Gamepad + \(resolution.rawValue)p Configured"))
+    }
+
+    static func volumeFreeBytes(at url: URL) -> Int64? {
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+        if let important = values?.volumeAvailableCapacityForImportantUsage, important > 0 {
+            return important
+        }
+        if let basic = values?.volumeAvailableCapacity {
+            return Int64(basic)
+        }
+        return nil
+    }
+
+    static func tailOfFile(_ url: URL, maxLines: Int) -> String {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return "" }
+        let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        let lines = text.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        return lines.suffix(maxLines).joined(separator: "\n")
     }
 
     static func directorySizeBytesViaDu(at url: URL) -> Int64 {
@@ -2926,7 +3012,7 @@ enum SelfTestRunner {
                 try assertCondition(bitmap.pixelsWide >= 740 && bitmap.pixelsHigh >= 560, "Rendered live 740x560 SwiftUI LauncherMainView to bitmap (\(bitmap.pixelsWide)x\(bitmap.pixelsHigh) px)")
             }
 
-            // 4. Verify Complete 4-Step A-to-Z Pipeline End-to-End (HTML Quota-Error Protection, 50%->100% Append-Only Resume, 7zz Extraction, QuickSFV Neutralization, winxp64 -> setup.exe -> win10, Azimuth Setup)
+            // 4. Verify Complete 4-Step A-to-Z Pipeline End-to-End (HTML Quota-Error Protection, 50%->100% Append-Only Resume, 7zz Extraction, QuickSFV Neutralization, win7 -> setup.exe -> win10, Azimuth Setup)
             let mockRepackSrc = tempRoot.appendingPathComponent("Forza Horizon 2 [FitGirl Repack]")
             try fm.createDirectory(at: mockRepackSrc.appendingPathComponent("MD5"), withIntermediateDirectories: true)
             try fm.createDirectory(at: mockRepackSrc.appendingPathComponent("_Redist"), withIntermediateDirectories: true)
@@ -3052,7 +3138,7 @@ enum SelfTestRunner {
 
             let wineCalls = (try? String(contentsOf: mockWineLog, encoding: .utf8)) ?? ""
             try assertCondition(wineCalls.contains("QUICKSFV_NEUTRALIZED=YES"), "Neutralized both MD5/QuickSFV.EXE and _Redist/QuickSFV.exe with noop.exe before setup.exe ran")
-            try assertCondition(wineCalls.contains("Version /t REG_SZ /d winxp64"), "Wine prefix was set to winxp64 before running setup.exe")
+            try assertCondition(wineCalls.contains("Version /t REG_SZ /d win7"), "Wine prefix was set to win7 before running setup.exe")
             try assertCondition(wineCalls.contains(#"C:\fg_setup\setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /DIR=C:\FH2Game"#), "setup.exe was invoked with /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /DIR=C:\\FH2Game")
             try assertCondition(wineCalls.contains("Version /t REG_SZ /d win10"), "Wine prefix was restored to win10 after setup.exe completed")
             try assertCondition(wineCalls.contains("d3d12 /t REG_SZ /d native,builtin"), "Step 4 configured Wine DLL overrides for Azimuth")
@@ -3081,7 +3167,7 @@ enum SelfTestRunner {
     /// 2. Downloads & verifies the real `MD5/QuickSFV.EXE`, `MD5/fitgirl-bins.md5`, `fg-06.bin`, and `setup.exe` from `FH2-Game.zip` on Google Drive.
     /// 3. Runs the REAL 4-Step Pipeline (`executeFourStepSetupPipeline` with `mockRuntimeEnv: nil`):
     ///    - Step 1 downloads the real 239 MB `Game Porting Toolkit.app` (`game-porting-toolkit-3.0-3.tar.xz`) from GitHub Releases, installs `~/Applications/Game Porting Toolkit.app`, and verifies `D3DMetal.framework` signature & Rosetta 2.
-    ///    - Step 2 & Step 3 extract the repack archive with bundled `7zz`, neutralize `QuickSFV.EXE` with `noop.exe`, run a real 64-bit Windows PE `setup.exe` under `wine64` in `winxp64` mode to unpack `C:\FH2Game\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\Mount\forza_durango_release_final.exe` and `AppxManifest.xml`, restore `win10`, and move the unpacked game to `~/Games/Forza Horizon 2`.
+    ///    - Step 2 & Step 3 extract the repack archive with bundled `7zz`, neutralize `QuickSFV.EXE` with `noop.exe`, run a real 64-bit Windows PE `setup.exe` under `wine64` in `win7` mode to unpack `C:\FH2Game\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\Mount\forza_durango_release_final.exe` and `AppxManifest.xml`, restore `win10`, and move the unpacked game to `~/Games/Forza Horizon 2`.
     ///    - Step 4 configures `C:\Azimuth` with `azimuth.exe`, `d3d12.dll`, `fh2pad.dll`, `d3dcompiler_47.dll`, `winmm.dll`, `FH2_ExtraOptions.ini`, `mods/`, Wine registry overrides, and `data/azimuth.ini`.
     /// 4. Runs `vm.executeLaunchSequence()` under the real `Game Porting Toolkit.app` (`wine64` + `D3DMetal.framework`) for BOTH Azimuth `0.9.10` (`1.0.3`) and Azimuth `1.0.1` with `enableExtraOptions = true`, verifying `fh2port.log` (`fh2port d3d12 proxy loaded, real d3d12`), `azimuth.log`, and `winmm.dll` SHA-256 verification without `REFUSED:`.
     /// 5. Runs a compiled 64-bit Windows PE harness (`verify_mods_and_shims.exe`) under `wine64` in `C:\Azimuth` that loads and initializes `winmm.dll`, `EO_GarageEngineRev.dll`, `EO_WeatherControl.dll` (verifying `FH2PluginMediaDirectory()` mounts the 15 `.xaml` files), and `fh2pad.dll` (`Windows.Gaming.Input.Gamepad` WinRT activation factory).
@@ -3429,8 +3515,8 @@ enum SelfTestRunner {
             let verifyTxtURL = defaultGameDir.appendingPathComponent("setup_verification.txt")
             let verifyTxt = (try? String(contentsOf: verifyTxtURL, encoding: .utf8)) ?? ""
             try assertCondition(
-                verifyTxt.contains("WIN_VERSION=5.2") && verifyTxt.contains("QUICKSFV_DISABLED=1") && verifyTxt.contains("FREARC_HEADER_OK=1"),
-                "Real Wine64 ran setup.exe under winxp64 (5.2), neutralized QuickSFV.EXE, and verified FreeArc fg-06.bin (\(verifyTxt.replacingOccurrences(of: "\n", with: " ")))"
+                verifyTxt.contains("WIN_VERSION=6.1") && verifyTxt.contains("QUICKSFV_DISABLED=1") && verifyTxt.contains("FREARC_HEADER_OK=1"),
+                "Real Wine64 ran setup.exe under win7 (6.1), neutralized QuickSFV.EXE, and verified FreeArc fg-06.bin (\(verifyTxt.replacingOccurrences(of: "\n", with: " ")))"
             )
             let unpackedExe = defaultGameDir.appendingPathComponent("Anthem_1.0.0.64_x64__8wekyb3d8bbwe/Mount/forza_durango_release_final.exe")
             try assertCondition(
