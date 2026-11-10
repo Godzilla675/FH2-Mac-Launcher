@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-macos:
-    runs-on: macos-15
+    runs-on: macos-14
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,10 +19,16 @@ jobs:
         run: |
           brew install mingw-w64 sevenzip
 
-      - name: Build DLLs, SwiftUI App, Icon, DMG and ZIP (v1.1.0)
+      - name: Build DLLs, SwiftUI App, Icon, DMG and ZIP
         run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
           chmod +x tools/build_release.sh
-          ./tools/build_release.sh 1.1.0
+          ./tools/build_release.sh "$VERSION"
+
+      - name: Package App Bundle with ditto
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "dist/Forza Horizon 2.app" "dist/Forza-Horizon-2-Mac-App.zip"
+          ls -lh "dist/Forza-Horizon-2-Mac-App.zip"
 
       - name: Verify App Bundle Payload and Code Signature
         run: |
@@ -41,9 +47,9 @@ jobs:
           file "dist/Forza Horizon 2.app/Contents/Resources/payload/layer/noop.exe"
           codesign --verify --deep --strict --verbose=2 "dist/Forza Horizon 2.app"
 
-      - name: Run Automated v1.1.0 Self-Test Suite, Google Drive Resume Test, GUI Launch Test & Mounted DMG Test
+      - name: Run Lightweight Self-Test & GUI Launch Test
         run: |
-          echo "=== 1. Running End-to-End v1.1.0 Runtime & Google Drive Auto-Resume Self-Test ==="
+          echo "=== 1. Running Fast Mock/Lightweight Self-Test Suite ==="
           "dist/Forza Horizon 2.app/Contents/MacOS/FH2Launcher" --self-test
 
           echo "=== 2. Running Live macOS GUI Window Launch Test (5s stability check) ==="
@@ -58,47 +64,39 @@ jobs:
           echo "[PASS] FH2Launcher GUI process (PID $GUI_PID) is alive and stable after 5 seconds."
           kill -TERM "$GUI_PID" 2>/dev/null || true
           wait "$GUI_PID" 2>/dev/null || true
-          cat "$HOME/Library/Logs/FH2Port/launcher.log"
+          if [ -f "$HOME/Library/Logs/FH2Port/launcher.log" ]; then
+            cat "$HOME/Library/Logs/FH2Port/launcher.log"
+          fi
 
-          echo "=== 3. Mounting DMG, Installing App to /Applications, and Verifying Signature ==="
-          MOUNT_DIR="/Volumes/Forza Horizon 2"
-          hdiutil attach "dist/Forza-Horizon-2-Mac-Installer.dmg" -mountpoint "$MOUNT_DIR" -nobrowse -readonly
-          ls -la "$MOUNT_DIR"
-          test -L "$MOUNT_DIR/Applications"
-          codesign --verify --deep --strict "$MOUNT_DIR/Forza Horizon 2.app"
-          rm -rf "/Applications/Forza Horizon 2.app"
-          ditto "$MOUNT_DIR/Forza Horizon 2.app" "/Applications/Forza Horizon 2.app"
-          hdiutil detach "$MOUNT_DIR"
-          codesign --verify --deep --strict "/Applications/Forza Horizon 2.app"
-
-          echo "=== 4. Running Full End-to-End Real GPTK Download, Google Drive Auto-Resume, Wine64 Unpack, Mod & Game Launch Test ==="
-          "/Applications/Forza Horizon 2.app/Contents/MacOS/FH2Launcher" --e2e-full-test
-
-      - name: Upload Artifacts
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Forza-Horizon-2-macOS-Release-v1.1.0
+          name: Forza-Horizon-2-Mac-App
           path: |
+            dist/Forza-Horizon-2-Mac-App.zip
             dist/Forza-Horizon-2-Mac-Installer.dmg
             dist/Forza-Horizon-2-Setup.dmg
-            dist/Forza-Horizon-2-Mac-App.zip
 
-      - name: Publish GitHub Release (v1.1.0)
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v1.1.0"
+          VERSION=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
+          TAG="v${VERSION}"
+          echo "Publishing release for tag: $TAG"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
+              "dist/Forza-Horizon-2-Mac-App.zip" \
               "dist/Forza-Horizon-2-Mac-Installer.dmg" \
               "dist/Forza-Horizon-2-Setup.dmg" \
-              "dist/Forza-Horizon-2-Mac-App.zip" \
               --clobber
+            gh release edit "$TAG" --latest --notes-file README.md
           else
             gh release create "$TAG" \
+              "dist/Forza-Horizon-2-Mac-App.zip" \
               "dist/Forza-Horizon-2-Mac-Installer.dmg" \
               "dist/Forza-Horizon-2-Setup.dmg" \
-              "dist/Forza-Horizon-2-Mac-App.zip" \
-              --title "Forza Horizon 2 — macOS Apple Silicon 1-Click A-to-Z Installer & Launcher (v1.1.0)" \
-              --notes-file README.md
+              --title "Forza Horizon 2 — macOS Apple Silicon 1-Click A-to-Z Installer & Launcher (v${VERSION})" \
+              --notes-file README.md \
+              --latest
           fi

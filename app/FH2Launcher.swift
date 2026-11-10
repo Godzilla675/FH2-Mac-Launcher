@@ -994,7 +994,7 @@ final class LauncherViewModel: ObservableObject {
         var totalAppended: Int64 = 0
         while true {
             var shouldStop = false
-            try autoreleasepool {
+            autoreleasepool {
                 var toRead = bufferSize
                 if let limit = maxBytes {
                     let remaining = limit - totalAppended
@@ -2696,7 +2696,7 @@ struct LauncherMainView: View {
                     .stroke(Theme.cardBorder, lineWidth: 1)
             )
             .cornerRadius(6)
-            .onChange(of: vm.logs.count) { _ in
+            .onChange(of: vm.logs.count) {
                 if !vm.logs.isEmpty {
                     proxy.scrollTo(vm.logs.count - 1, anchor: .bottom)
                 }
