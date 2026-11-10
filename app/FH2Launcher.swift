@@ -533,6 +533,9 @@ final class LauncherViewModel: ObservableObject {
         var foundGPTKWineLib: URL? = nil
 
         for appURL in gptkCandidates {
+            if isGPTKVersionOutdated(at: appURL) {
+                continue
+            }
             let wine64 = appURL.appendingPathComponent("Contents/Resources/wine/bin/wine64")
             let wine = appURL.appendingPathComponent("Contents/Resources/wine/bin/wine")
             let server = appURL.appendingPathComponent("Contents/Resources/wine/bin/wineserver")
@@ -637,6 +640,27 @@ final class LauncherViewModel: ObservableObject {
             highballRoot: nil,
             gptkAppURL: nil
         )
+    }
+
+    static func gptkAppVersion(at appURL: URL) -> String? {
+        let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let dict = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            return nil
+        }
+        return (dict["CFBundleShortVersionString"] as? String) ?? (dict["CFBundleVersion"] as? String)
+    }
+
+    static func isGPTKVersionOutdated(at appURL: URL) -> Bool {
+        guard let ver = gptkAppVersion(at: appURL)?.trimmingCharacters(in: .whitespaces), !ver.isEmpty else {
+            return false
+        }
+        // GPTK 1.0 and 1.1 use Wine 7.7 which has a fatal 32-bit `alloc_pages_vprot` assertion crash in ntdll/virtual.c.
+        // Versions < 2.0 (e.g. "1.0", "1.1", "1.1-gstreamer") are obsolete and cannot run Inno Setup repacks.
+        if ver.hasPrefix("1.") || ver == "1" {
+            return true
+        }
+        return false
     }
 
     var isAzimuth101Available: Bool {
@@ -1383,7 +1407,14 @@ final class LauncherViewModel: ObservableObject {
 
             let gptkWine64 = gptkAppDest.appendingPathComponent("Contents/Resources/wine/bin/wine64")
             let gptkWine = gptkAppDest.appendingPathComponent("Contents/Resources/wine/bin/wine")
-            if !fm.fileExists(atPath: gptkWine64.path) && !fm.fileExists(atPath: gptkWine.path) {
+            let isOutdated = Self.isGPTKVersionOutdated(at: gptkAppDest)
+            if (!fm.fileExists(atPath: gptkWine64.path) && !fm.fileExists(atPath: gptkWine.path)) || isOutdated {
+                if isOutdated {
+                    let oldVer = Self.gptkAppVersion(at: gptkAppDest) ?? "1.x"
+                    appendLog("Existing Game Porting Toolkit at \(gptkAppDest.path) is outdated (v\(oldVer), Wine 7.7 has 32-bit alloc_pages_vprot bug). Upgrading to Game Porting Toolkit 3.0...")
+                    updateStep1(.active(progress: 0.10, detail: "Upgrading Game Porting Toolkit from v\(oldVer) to v3.0..."))
+                    try? fm.removeItem(at: gptkAppDest)
+                }
                 let runtimePart = workCacheDir.appendingPathComponent("runtime.tar.xz.part")
                 let runtimeArchive = workCacheDir.appendingPathComponent("runtime.tar.xz")
                 let resolvedRuntime = Self.resolveLatestRuntimeAsset(manifest: self.manifest)
